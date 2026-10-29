@@ -1,0 +1,70 @@
+FROM python:3.12-slim AS builder
+
+WORKDIR /build
+
+ARG APT_HTTP_PROXY
+ARG APT_HTTPS_PROXY
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG ALL_PROXY
+ARG PIP_DEFAULT_TIMEOUT=120
+
+ENV HTTP_PROXY=${HTTP_PROXY} \
+    HTTPS_PROXY=${HTTPS_PROXY} \
+    ALL_PROXY=${ALL_PROXY} \
+    PIP_DEFAULT_TIMEOUT=${PIP_DEFAULT_TIMEOUT}
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    if [ -n "${APT_HTTP_PROXY:-}" ]; then echo "Acquire::http::Proxy \"${APT_HTTP_PROXY}\";" > /etc/apt/apt.conf.d/99proxy; fi \
+    && if [ -n "${APT_HTTPS_PROXY:-}" ]; then echo "Acquire::https::Proxy \"${APT_HTTPS_PROXY}\";" >> /etc/apt/apt.conf.d/99proxy; fi \
+    && apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    libgl1 \
+    libglib2.0-0 \
+    libgomp1 \
+    && rm -rf /var/lib/apt/lists/* /etc/apt/apt.conf.d/99proxy
+
+COPY requirements-api.txt .
+RUN --mount=type=cache,target=/root/.cache/pip \
+    pip install -r requirements-api.txt
+
+FROM python:3.12-slim
+
+WORKDIR /app
+
+ARG APT_HTTP_PROXY
+ARG APT_HTTPS_PROXY
+ARG HTTP_PROXY
+ARG HTTPS_PROXY
+ARG ALL_PROXY
+
+ENV HTTP_PROXY=${HTTP_PROXY} \
+    HTTPS_PROXY=${HTTPS_PROXY} \
+    ALL_PROXY=${ALL_PROXY}
+
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
+    if [ -n "${APT_HTTP_PROXY:-}" ]; then echo "Acquire::http::Proxy \"${APT_HTTP_PROXY}\";" > /etc/apt/apt.conf.d/99proxy; fi \
+    && if [ -n "${APT_HTTPS_PROXY:-}" ]; then echo "Acquire::https::Proxy \"${APT_HTTPS_PROXY}\";" >> /etc/apt/apt.conf.d/99proxy; fi \
+    && apt-get update && apt-get install -y --no-install-recommends \
+    libgl1 \
+    libglib2.0-0 \
+    libgomp1 \
+    && rm -rf /var/lib/apt/lists/* /etc/apt/apt.conf.d/99proxy
+
+COPY --from=builder /usr/local/lib/python3.12/site-packages /usr/local/lib/python3.12/site-packages
+COPY --from=builder /usr/local/bin /usr/local/bin
+
+COPY . .
+
+RUN mkdir -p logs && chmod +x entrypoint.sh
+
+ENV PYTHONPATH=/app
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
+    CMD python -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health')" || exit 1
+
+ENTRYPOINT ["./entrypoint.sh"]

@@ -1,0 +1,25 @@
+# Database (worker reads/writes Source rows)
+sqlalchemy[asyncio]==2.0.38
+asyncpg==0.30.0
+
+# Settings & validation
+pydantic==2.10.6
+pydantic-settings==2.7.1
+
+# PDF parsing
+marker-pdf==1.6.2
+PyMuPDF>=1.24.0
+
+# Embedding
+sentence-transformers==3.4.1
+
+# Vector store
+qdrant-client==1.13.3
+
+# HTTP server for /embed + /health endpoints
+fastapi==0.115.8
+uvicorn[standard]==0.34.0
+
+# Utilities
+httpx>=0.23.0,<0.28.0
+python-docx>=1.1,<2

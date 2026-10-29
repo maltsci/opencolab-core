@@ -1,0 +1,33 @@
+# Production-image overlay for the test server. The base file describes the
+# development stack (Vite dev server on 5173, source bind-mounted); this one
+# swaps the frontend for the nginx image built by the `production` stage.
+#
+# `!override` replaces the published-port list instead of appending to it:
+# nginx listens on 80 inside the image, so keeping the base 8430:5173 mapping
+# next to a 8430:80 one would leave the front page unreachable and, worse,
+# make compose refuse to allocate the port twice.
+#
+# `image` is pinned to a name the base file never uses. Both modes used to share
+# the implicit `<project>-frontend` tag, so `up -d frontend` after a mode switch
+# reused whichever image was built last: measured on 2026-09-26, the dev stack
+# came up on the nginx image and restart-looped `npm: not found` with nothing
+# listening on 8430. Separate tags make a mode switch a container recreate, and
+# `--build` an optimisation rather than a requirement.
+#
+# `environment` merges per key, so this one line switches the reloader off
+# (`backend/entrypoint.sh:12`) without dropping the rest of the api environment.
+# The backend source is still bind-mounted, so a code update on this host is
+# `git pull` plus a restart rather than a rebuild - just no file watcher.
+services:
+  frontend:
+    build:
+      context: ./frontend
+      target: production
+    image: opencolab-frontend-nginx:latest
+    ports: !override
+      - "${FRONTEND_PORT:-8430}:80"
+    command: ["nginx", "-g", "daemon off;"]
+
+  api:
+    environment:
+      - OPENCOLAB_DEV_RELOAD=false

@@ -1,0 +1,23 @@
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  padding: 0;
+  min-height: 100vh;
+}
+
+body {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Visible focus indicator for the chat composer (WCAG 2.4.7). The TextArea
+   border is stripped in ChatInput.tsx, so the wrapper provides the outline. */
+.chat-input-wrapper:focus-within {
+  outline: 2px solid #1677ff;
+  outline-offset: 1px;
+}

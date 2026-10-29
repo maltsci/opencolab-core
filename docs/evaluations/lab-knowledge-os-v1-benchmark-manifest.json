@@ -1,0 +1,13 @@
+{
+  "frozen_at": null,
+  "sha256": null,
+  "category_counts": {
+    "people": null,
+    "research": null,
+    "resources": null,
+    "cross_entity": null
+  },
+  "limited_or_no_answer_count": null,
+  "multi_permission_count": null,
+  "approval_roles": []
+}

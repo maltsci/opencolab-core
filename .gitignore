@@ -1,0 +1,91 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+*.egg
+dist/
+build/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+
+# Node / Frontend
+node_modules/
+frontend/dist/
+frontend/build/
+.next/
+
+# Environment variables (only .env.template and .env.example are committed)
+.env
+.env.*
+!.env.template
+!.env.example
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Log files
+logs/
+backend/logs/
+frontend/logs/
+
+# User uploads (contains private data, MUST NOT be committed)
+uploads/
+backend/uploads/
+# Runtime skill packs and model caches (local data, MUST NOT be committed)
+backend/skill-packs/
+/models/
+/local-tools/
+# Generated distribution artifacts
+/artifacts/
+
+# Local vector database storage
+local_db/
+chroma_data/
+qdrant_storage/
+
+# Temporary data (do not commit)
+tmp/
+test.db
+evaluation-data/
+.superpowers/
+.worktrees/
+codex-workspace/
+
+# Testing & coverage
+.pytest_cache/
+htmlcov/
+.coverage
+.coverage.*
+coverage/
+
+# Distribution
+*.whl
+
+# Local LLM docs cache/output (do not commit)
+docs/litellm/
+.gstack/
+
+# Local agent scratch, not source: presentation build intermediates (candidate
+# .pptx plus per-slide renders, ~280 MB together), a plan draft, and a design
+# context file gathered on this machine.
+.codex-finalizer/
+.codex-ppt-build/
+/plans/
+/.impeccable.md
+
+# Local dependency links used during development
+/backend/.venv
+/frontend/node_modules

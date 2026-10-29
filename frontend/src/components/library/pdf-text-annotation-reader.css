@@ -1,0 +1,196 @@
+.pdf-text-annotation-reader {
+  background: #fff;
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.pdf-reader-toolbar {
+  align-items: center;
+  border-bottom: 1px solid rgba(5, 5, 5, 0.08);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 20px;
+  justify-content: space-between;
+  padding: 8px 16px;
+}
+
+.pdf-reader-loading {
+  margin: 64px auto;
+}
+
+.pdf-reader-text {
+  background: #fbfcfa;
+  flex: 1;
+  min-height: 280px;
+  overflow: auto;
+  padding: 28px clamp(20px, 6vw, 88px);
+}
+
+.pdf-reader-document {
+  color: #28332f;
+  font-family: ui-serif, Georgia, Cambria, 'Times New Roman', serif;
+  font-size: 15px;
+  line-height: 1.9;
+  margin: 0 auto;
+  max-width: 860px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.pdf-reader-line {
+  display: block;
+  min-height: 1.9em;
+}
+
+.pdf-reader-line.is-heading-1,
+.pdf-reader-line.is-heading-2,
+.pdf-reader-line.is-heading-3 {
+  color: #1d3934;
+  font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  line-height: 1.35;
+  margin-top: 1.35em;
+}
+
+.pdf-reader-line.is-heading-1 {
+  font-size: 1.6em;
+}
+
+.pdf-reader-line.is-heading-2 {
+  font-size: 1.3em;
+}
+
+.pdf-reader-line.is-heading-3 {
+  font-size: 1.1em;
+}
+
+.pdf-reader-line.is-list {
+  padding-left: 1.25em;
+}
+
+.pdf-reader-line.is-quote {
+  border-left: 2px solid #a7beb4;
+  color: #52645d;
+  margin: 0.5em 0;
+  padding-left: 1em;
+}
+
+.pdf-reader-line.is-table,
+.pdf-reader-line.is-formula,
+.pdf-reader-line.is-code {
+  background: #f5f7f4;
+  border: 1px solid #e3e9e4;
+  border-radius: 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  font-size: 0.92em;
+  margin: 0.45em 0;
+  overflow-x: auto;
+  padding: 0.35em 0.6em;
+}
+
+.pdf-reader-line.is-formula {
+  background: #fbfbf6;
+  color: #263d36;
+  font-size: 1em;
+  text-align: center;
+}
+
+.pdf-reader-line.is-figure {
+  background: #f7faf8;
+  border-left: 3px solid #7c9b8c;
+  color: #49665a;
+  font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  margin: 0.8em 0;
+  padding: 0.6em 0.85em;
+}
+
+.pdf-reader-line.is-page-break {
+  color: #73847d;
+  font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  margin: 1.5em 0 0.5em;
+  text-transform: uppercase;
+}
+
+.pdf-reader-highlight {
+  background: #fff1a8;
+  border-radius: 2px;
+  box-decoration-break: clone;
+  color: inherit;
+  cursor: pointer;
+  padding: 1px 0;
+}
+
+.pdf-reader-highlight.is-active {
+  background: #ffd666;
+  outline: 2px solid #d48806;
+  outline-offset: 1px;
+}
+
+.pdf-reader-composer {
+  border-top: 1px solid rgba(5, 5, 5, 0.08);
+  box-shadow: 0 -6px 16px rgba(0, 0, 0, 0.04);
+  padding: 12px 16px;
+}
+
+.pdf-reader-selection {
+  align-items: center;
+  display: flex;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.pdf-reader-composer-actions {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+  margin-top: 8px;
+}
+
+.pdf-reader-note-popover {
+  max-width: min(360px, calc(100vw - 48px));
+}
+
+.pdf-reader-note-popover .ant-typography {
+  margin: 0 0 8px;
+}
+
+.pdf-reader-note-meta {
+  align-items: center;
+  display: flex;
+  gap: 10px;
+}
+
+.pdf-reader-note-meta .ant-btn {
+  margin-left: auto;
+}
+
+.pdf-reader-delete-confirmation {
+  border-top: 1px solid #e8ece8;
+  display: grid;
+  gap: 8px;
+  margin-top: 10px;
+  padding-top: 10px;
+}
+
+.pdf-reader-delete-confirmation > div {
+  display: flex;
+  gap: 8px;
+  justify-content: flex-end;
+}
+
+@media (max-width: 640px) {
+  .pdf-reader-text {
+    padding: 18px;
+  }
+
+  .pdf-reader-toolbar {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+}

@@ -1,0 +1,190 @@
+services:
+  frontend:
+    build:
+      context: ./frontend
+      target: build
+    ports:
+      - "${FRONTEND_PORT:-8430}:${FRONTEND_CONTAINER_PORT:-5173}"
+    command: npm run dev -- --host 0.0.0.0
+    restart: unless-stopped
+    environment:
+      - VITE_API_PROXY_TARGET=http://api:8000
+    volumes:
+      - ./frontend:/app
+      - frontend-node-modules:/app/node_modules
+    depends_on:
+      api:
+        condition: service_healthy
+
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.api
+      args:
+        APT_HTTP_PROXY: ${APT_HTTP_PROXY:-}
+        APT_HTTPS_PROXY: ${APT_HTTPS_PROXY:-}
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+        ALL_PROXY: ${ALL_PROXY:-}
+        PIP_DEFAULT_TIMEOUT: ${PIP_DEFAULT_TIMEOUT:-120}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    ports:
+      - "${API_PORT:-8431}:8000"
+    entrypoint: ["/bin/bash", "/app/entrypoint.sh"]
+    restart: unless-stopped
+    environment:
+      - OPENCOLAB_DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      - OPENCOLAB_QDRANT_HOST=qdrant
+      - OPENCOLAB_QDRANT_PORT=6333
+      - OPENCOLAB_SECRET_KEY=${OPENCOLAB_SECRET_KEY}
+      - OPENCOLAB_ADMIN_PASSWORD=${OPENCOLAB_ADMIN_PASSWORD:-}
+      - OPENCOLAB_LLM_MODEL=${OPENCOLAB_LLM_MODEL:-gpt-4o-mini}
+      - OPENCOLAB_LLM_API_BASE=${OPENCOLAB_LLM_API_BASE:-}
+      - OPENCOLAB_LLM_API_KEY=${OPENCOLAB_LLM_API_KEY:-}
+      - OPENCOLAB_LLM_PROXY=${OPENCOLAB_LLM_PROXY:-}
+      - OPENCOLAB_CODEX_RUNTIME_URL=http://codex-sandbox:8102
+      - OPENCOLAB_CODEX_RUNTIME_API_KEY=${OPENCOLAB_CODEX_RUNTIME_API_KEY:?Set OPENCOLAB_CODEX_RUNTIME_API_KEY in .env}
+      - OPENCOLAB_CODEX_RUNTIME_DEFAULT_SANDBOX=danger-full-access
+      - OPENCOLAB_CODEX_RUNTIME_WORKSPACE_DIR=/codex-workspace
+      - OPENCOLAB_CODEX_RUNTIME_SANDBOX_WORKSPACE_DIR=/workspace
+      - HTTP_PROXY=${OPENCOLAB_LLM_PROXY:-}
+      - HTTPS_PROXY=${OPENCOLAB_LLM_PROXY:-}
+      - ALL_PROXY=${OPENCOLAB_LLM_PROXY:-}
+      - NO_PROXY=localhost,127.0.0.1,::1,api,worker,codex-sandbox,postgres,qdrant
+      - no_proxy=localhost,127.0.0.1,::1,api,worker,codex-sandbox,postgres,qdrant
+      - OPENCOLAB_UPLOAD_DIR=/data/uploads
+      - OPENCOLAB_MAX_FILE_SIZE_MB=${OPENCOLAB_MAX_FILE_SIZE_MB:-50}
+      - OPENCOLAB_WORKER_URL=http://worker:8001
+      - OPENCOLAB_DEV_RELOAD=true
+    volumes:
+      - ./backend:/app
+      - ./uploads:/data/uploads
+      - ./codex-workspace:/codex-workspace
+      - backend-logs:/app/logs
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+
+  codex-sandbox:
+    build:
+      context: ./codex-sandbox
+      args:
+        CODEX_VERSION: ${CODEX_VERSION:-0.142.5}
+    ports:
+      - "127.0.0.1:8434:8102"
+    restart: unless-stopped
+    environment:
+      - CODEX_WORKDIR=/workspace
+      - CODEX_DEFAULT_SANDBOX=danger-full-access
+      - CODEX_RUN_TIMEOUT_SECONDS=${OPENCOLAB_CODEX_RUNTIME_TIMEOUT_SECONDS:-1800}
+      - CODEX_WIRE_API=${OPENCOLAB_CODEX_WIRE_API:-responses}
+      - SANDBOX_API_KEY=${OPENCOLAB_CODEX_RUNTIME_API_KEY:?Set OPENCOLAB_CODEX_RUNTIME_API_KEY in .env}
+      - HTTP_PROXY=${OPENCOLAB_LLM_PROXY:-}
+      - HTTPS_PROXY=${OPENCOLAB_LLM_PROXY:-}
+      - ALL_PROXY=${OPENCOLAB_LLM_PROXY:-}
+      - NO_PROXY=localhost,127.0.0.1,::1,api,worker,codex-sandbox,postgres,qdrant
+      - no_proxy=localhost,127.0.0.1,::1,api,worker,codex-sandbox,postgres,qdrant
+    volumes:
+      - ./codex-workspace:/workspace
+      - codex-sandbox-home:/app/.codex
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f -s -H \"Authorization: Bearer $$SANDBOX_API_KEY\" http://localhost:8102/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.worker
+      args:
+        APT_HTTP_PROXY: ${APT_HTTP_PROXY:-}
+        APT_HTTPS_PROXY: ${APT_HTTPS_PROXY:-}
+        HTTP_PROXY: ${HTTP_PROXY:-}
+        HTTPS_PROXY: ${HTTPS_PROXY:-}
+        ALL_PROXY: ${ALL_PROXY:-}
+        PIP_DEFAULT_TIMEOUT: ${PIP_DEFAULT_TIMEOUT:-120}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+    environment:
+      - OPENCOLAB_DATABASE_URL=postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}
+      - OPENCOLAB_QDRANT_HOST=qdrant
+      - OPENCOLAB_QDRANT_PORT=6333
+      - OPENCOLAB_UPLOAD_DIR=/data/uploads
+      - OPENCOLAB_PDF_PPS_ENABLED=${OPENCOLAB_PDF_PPS_ENABLED:-false}
+      - OPENCOLAB_PDF_PPS_JOBS_URL=${OPENCOLAB_PDF_PPS_JOBS_URL:-}
+      - OPENCOLAB_PDF_PPS_API_KEY=${OPENCOLAB_PDF_PPS_API_KEY:-${PPS_LOCAL_API_KEY:-${LOCAL_MODEL_SERVICE_TOKEN:-}}}
+      - OPENCOLAB_PDF_PPS_TIMEOUT_SECONDS=${OPENCOLAB_PDF_PPS_TIMEOUT_SECONDS:-300}
+      - OPENCOLAB_PDF_PPS_POLL_INTERVAL_SECONDS=${OPENCOLAB_PDF_PPS_POLL_INTERVAL_SECONDS:-3}
+      - OPENCOLAB_PDF_PARSE_TIMEOUT_SECONDS=${OPENCOLAB_PDF_PARSE_TIMEOUT_SECONDS:-180}
+      - OPENCOLAB_PDF_MARKER_ENABLED=${OPENCOLAB_PDF_MARKER_ENABLED:-false}
+      - OPENCOLAB_PDF_MARKER_DEVICE=${OPENCOLAB_PDF_MARKER_DEVICE:-}
+      - OPENCOLAB_PDF_MARKER_DTYPE=${OPENCOLAB_PDF_MARKER_DTYPE:-}
+      - OPENCOLAB_PDF_MARKER_PRELOAD_ENABLED=${OPENCOLAB_PDF_MARKER_PRELOAD_ENABLED:-false}
+      - OPENCOLAB_WORKER_MAX_CONCURRENT=${OPENCOLAB_WORKER_MAX_CONCURRENT:-1}
+      - OPENCOLAB_EMBEDDING_MODEL=${EMBEDDING_MODEL:-BAAI/bge-m3}
+      - OPENCOLAB_EMBEDDING_PROVIDER=${OPENCOLAB_EMBEDDING_PROVIDER:-local}
+      - OPENCOLAB_EMBEDDING_FALLBACK_PROVIDER=${OPENCOLAB_EMBEDDING_FALLBACK_PROVIDER:-none}
+      - OPENCOLAB_EMBEDDING_LOCAL_MODEL_PATH=${OPENCOLAB_EMBEDDING_LOCAL_MODEL_PATH:-}
+      - OPENCOLAB_EMBEDDING_LOCAL_FILES_ONLY=${OPENCOLAB_EMBEDDING_LOCAL_FILES_ONLY:-true}
+      - OPENCOLAB_SILICONFLOW_API_KEY=${OPENCOLAB_SILICONFLOW_API_KEY:-}
+      - OPENCOLAB_SILICONFLOW_BASE_URL=${OPENCOLAB_SILICONFLOW_BASE_URL:-https://api.siliconflow.cn/v1}
+      - OPENCOLAB_SILICONFLOW_EMBEDDING_MODEL=${OPENCOLAB_SILICONFLOW_EMBEDDING_MODEL:-BAAI/bge-large-zh-v1.5}
+      - HF_HOME=${HF_HOME:-/models/huggingface}
+      - HUGGINGFACE_HUB_CACHE=${HUGGINGFACE_HUB_CACHE:-/models/huggingface/hub}
+      - TRANSFORMERS_CACHE=${TRANSFORMERS_CACHE:-/models/huggingface/transformers}
+      - TORCH_HOME=${TORCH_HOME:-/models/torch}
+      - XDG_CACHE_HOME=${XDG_CACHE_HOME:-/models/cache}
+    volumes:
+      - ./backend:/app
+      - ./uploads:/data/uploads
+      # Persist marker/surya/HuggingFace/embedding model caches across restarts.
+      - ./models:/models
+    depends_on:
+      postgres:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+
+  postgres:
+    image: postgres:16-alpine
+    ports:
+      - "8432:5432"
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - pg-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  qdrant:
+    image: qdrant/qdrant:v1.13.2
+    ports:
+      - "8433:6333"
+    restart: unless-stopped
+    volumes:
+      - qdrant-data:/qdrant/storage
+    healthcheck:
+      test: ["CMD-SHELL", "bash -c 'exec 3<>/dev/tcp/localhost/6333' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+volumes:
+  pg-data:
+  qdrant-data:
+  backend-logs:
+  frontend-node-modules:
+  codex-sandbox-home:
