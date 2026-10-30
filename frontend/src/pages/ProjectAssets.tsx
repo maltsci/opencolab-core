@@ -31,7 +31,7 @@ export default function ProjectAssets({ embedded = false }: { embedded?: boolean
   const { projectId } = useParams();
   const [assets, setAssets] = useState<ResearchAsset[]>([]);
   const [projects, setProjects] = useState<ProjectOption[]>([]);
-  const [loading, setLoading] = useState(false);
+  const [loading, setLoading] = useState(true);
   const [uploading, setUploading] = useState(false);
   const [searchText, setSearchText] = useState('');
   const [projectSearchResults, setProjectSearchResults] = useState<LibrarySearchResponse | null>(null);
@@ -532,7 +532,7 @@ export default function ProjectAssets({ embedded = false }: { embedded?: boolean
             size="middle"
             scroll={{ x: 'max-content' }}
             pagination={{ pageSize: 10, hideOnSinglePage: true, showSizeChanger: false }}
-            locale={{ emptyText: <Empty description={t('library.projectEmpty')} /> }}
+            locale={{ emptyText: loading ? null : <Empty description={t('library.projectEmpty')} /> }}
           />
         )}
       </Space>
@@ -611,7 +611,7 @@ export default function ProjectAssets({ embedded = false }: { embedded?: boolean
             <List
               size="small"
               dataSource={collections}
-              locale={{ emptyText: <Empty description={t('projectAssets.collectionEmpty')} /> }}
+              locale={{ emptyText: loading ? null : <Empty description={t('projectAssets.collectionEmpty')} /> }}
               renderItem={(asset) => (
                 <List.Item>
                   <List.Item.Meta

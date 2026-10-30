@@ -6,6 +6,7 @@ import SectionCard from '../ui/SectionCard';
 import apiClient from '../../services/api-client';
 import type { Project } from '../../types/project';
 import type { TaskDefinition } from '../../types/task';
+import { localizeTask } from '../../utils/localize-task';
 import ProjectMembersCard from './ProjectMembersCard';
 
 interface ProjectConfigPanelProps {
@@ -26,7 +27,7 @@ export default function ProjectConfigPanel({
   canManage,
   onProjectUpdated,
 }: ProjectConfigPanelProps) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const [form] = Form.useForm<ConfigFormValues>();
   const [availableTasks, setAvailableTasks] = useState<TaskDefinition[]>([]);
   const [groupName, setGroupName] = useState<string | null>(null);
@@ -111,7 +112,7 @@ export default function ProjectConfigPanel({
               placeholder={t('projectHome.linkedTasksEmpty')}
               options={availableTasks.map((task) => ({
                 value: task.id,
-                label: task.name,
+                label: localizeTask(task, i18n).name,
               }))}
             />
           </Form.Item>

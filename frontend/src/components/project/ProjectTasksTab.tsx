@@ -15,6 +15,7 @@ import { useAuth } from '../../hooks/useAuth';
 import apiClient from '../../services/api-client';
 import type { Project, ProjectSession } from '../../types/project';
 import type { TaskDefinition } from '../../types/task';
+import { localizeTask } from '../../utils/localize-task';
 
 const { Text } = Typography;
 
@@ -25,13 +26,13 @@ interface ProjectTasksTabProps {
 }
 
 export default function ProjectTasksTab({ project }: ProjectTasksTabProps) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
   const { user } = useAuth();
   const navigate = useNavigate();
   const [sessions, setSessions] = useState<ProjectSession[]>([]);
   const [sessionsLoading, setSessionsLoading] = useState(true);
   const [availableTasks, setAvailableTasks] = useState<TaskDefinition[]>([]);
-  const [tasksLoading, setTasksLoading] = useState(false);
+  const [tasksLoading, setTasksLoading] = useState(true);
   const [creatingSession, setCreatingSession] = useState(false);
   const [renamingSession, setRenamingSession] = useState<ProjectSession | null>(null);
   const [renameValue, setRenameValue] = useState('');
@@ -94,7 +95,7 @@ export default function ProjectTasksTab({ project }: ProjectTasksTabProps) {
       const { data: session } = await apiClient.post<ProjectSession>('/sessions', {
         project_id: project.id,
         task_id: taskId,
-        title: task.name,
+        title: localizeTask(task, i18n).name,
       });
       navigate(`/sessions/${session.id}`, {
         state: { draftStorageKey, hasDraft: false },
@@ -141,7 +142,7 @@ export default function ProjectTasksTab({ project }: ProjectTasksTabProps) {
         <Spin spinning={sessionsLoading}>
           <List
             dataSource={sessions}
-            locale={{ emptyText: <Empty description={t('home.noProjectSessions')} /> }}
+            locale={{ emptyText: sessionsLoading ? null : <Empty description={t('home.noProjectSessions')} /> }}
             renderItem={(session) => {
               // owner_id is null on older payloads; treat unknown as own.
               const isOwn = !session.owner_id || session.owner_id === user?.id;
@@ -224,7 +225,7 @@ export default function ProjectTasksTab({ project }: ProjectTasksTabProps) {
               {recommendedTasks.map((task) => (
                 <TaskCard
                   key={task.id}
-                  task={task}
+                  task={localizeTask(task, i18n)}
                   onStart={(item) => { void startTask(item.id); }}
                   startLabel={t('task.useTask')}
                   globalLabel={t('task.scopeGlobal')}
@@ -237,9 +238,9 @@ export default function ProjectTasksTab({ project }: ProjectTasksTabProps) {
                 />
               ))}
             </div>
-          ) : (
+          ) : !tasksLoading ? (
             <Text type="secondary">{t('task.emptyLinked')}</Text>
-          )}
+          ) : null}
         </Spin>
       </SectionCard>
 

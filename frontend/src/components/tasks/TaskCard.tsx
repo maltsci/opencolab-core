@@ -1,5 +1,6 @@
 import { DatabaseOutlined, FileSearchOutlined, SaveOutlined } from '@ant-design/icons';
 import { Button, Space, Tag, Typography, theme } from 'antd';
+import { useTranslation } from 'react-i18next';
 
 import SectionCard from '../ui/SectionCard';
 import { getTaskRuntimeKind, type TaskDefinition } from '../../types/task';
@@ -40,6 +41,7 @@ export default function TaskCard({
   codexRuntimeLabel,
 }: TaskCardProps) {
   const { token } = theme.useToken();
+  const { t } = useTranslation();
   const helperText = task.starter_prompts[0];
   const isProjectTask = task.project_ids.length > 0;
   const usesProjectMaterials = task.project_context_policy.inherit_project_sources === true;
@@ -82,7 +84,7 @@ export default function TaskCard({
         {helperText ? (
           <div style={{ marginTop: 12 }}>
             <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 4 }}>
-              Example prompt
+              {t('task.examplePrompt')}
             </Text>
             <Text type="secondary" ellipsis style={{ display: 'block' }}>
               {helperText}
