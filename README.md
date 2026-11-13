@@ -10,6 +10,12 @@ This repository is the public foundation of OpenColab. It includes the project w
 
 [Documentation](docs/README.md) · [Deployment](docs/deployment.md) · [User guide](docs/user-guide.md) · [Architecture](docs/architecture.md) · [Development history](CHANGELOG.md)
 
+## Product demo
+
+[![Watch the OpenColab Core demo in English](https://img.youtube.com/vi/1UWnvoRap48/hqdefault.jpg)](https://youtu.be/1UWnvoRap48)
+
+[Watch in English](https://youtu.be/1UWnvoRap48) · [Watch in Chinese](https://youtu.be/G6jjXPAyXug)
+
 ## Who it is for
 
 | User | Main workflows |

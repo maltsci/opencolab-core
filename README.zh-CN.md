@@ -10,6 +10,12 @@ OpenColab Core 将项目文档、基于证据的 AI 对话、实验室知识和�
 
 [文档中心](docs/README.md) · [部署指南](docs/deployment.md) · [用户指南](docs/user-guide.md) · [系统架构](docs/architecture.md) · [开发历史](CHANGELOG.md)
 
+## 产品演示
+
+[![观看 OpenColab Core 中文演示视频](https://img.youtube.com/vi/G6jjXPAyXug/hqdefault.jpg)](https://youtu.be/G6jjXPAyXug)
+
+[观看中文视频](https://youtu.be/G6jjXPAyXug) · [观看英文视频](https://youtu.be/1UWnvoRap48)
+
 ## 面向用户
 
 | 用户 | 主要使用场景 |
