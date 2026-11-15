@@ -1,4 +1,6 @@
+import asyncio
 import json
+import logging
 import re
 from typing import Any
 
@@ -270,3 +272,171 @@ async def run_reviewer_assistant(
         "steps": steps,
         "trace_payload": trace_payload,
     }
+
+
+REVIEWER_SYSTEM_PROMPT_NEG = (
+    "You are an AI researcher who is reviewing a paper that was submitted to a prestigious "
+    "scientific venue. Be a critical and rigorous reviewer: if a paper is flawed, lacks "
+    "traceable evidence, or you are unsure of its validity, give it bad scores and reject it! "
+    "Return compact JSON only (no markdown fences) with keys: Summary (under 60 words), "
+    "Strengths (2-3 concise strings), Weaknesses (2-3 concise strings), Questions (2-3 concise strings), "
+    "Soundness (1-4), Presentation (1-4), Contribution (1-4), Overall (1-10), Confidence (1-5), "
+    "Decision ('Accept' or 'Reject')."
+)
+
+AREA_CHAIR_SYSTEM_PROMPT = (
+    "You are an Area Chair at a top scientific venue. Aggregate the ensemble of reviewer reports "
+    "into a single calibrated meta-review compact JSON only (no markdown fences) with keys: "
+    "Summary (under 60 words), Strengths (2-3 concise strings), Weaknesses (2-3 concise strings), "
+    "Questions (2-3 concise strings), Decision ('Accept' or 'Reject'). Be conservative: if reviewers "
+    "raise unaddressed methodological or provenance flaws, default to 'Reject'."
+)
+
+
+def _clamp_int(val: Any, low: int, high: int, default: int) -> int:
+    try:
+        num = int(round(float(val)))
+    except (TypeError, ValueError):
+        return default
+    return max(low, min(high, num))
+
+
+def _normalize_peer_review_scorecard(payload: dict[str, Any]) -> dict[str, Any]:
+    soundness = _clamp_int(payload.get("Soundness", payload.get("soundness")), 1, 4, 2)
+    presentation = _clamp_int(payload.get("Presentation", payload.get("presentation")), 1, 4, 2)
+    contribution = _clamp_int(payload.get("Contribution", payload.get("contribution")), 1, 4, 2)
+    overall = _clamp_int(payload.get("Overall", payload.get("overall")), 1, 10, 4)
+    confidence = _clamp_int(payload.get("Confidence", payload.get("confidence")), 1, 5, 3)
+    raw_decision = _normalize_string(payload.get("Decision") or payload.get("decision"))
+    decision = "Accept" if raw_decision.lower() == "accept" and overall >= 6 else "Reject"
+    return {
+        "Summary": _normalize_string(payload.get("Summary") or payload.get("summary")),
+        "Strengths": _normalize_string_list(payload.get("Strengths") or payload.get("strengths")),
+        "Weaknesses": _normalize_string_list(payload.get("Weaknesses") or payload.get("weaknesses")),
+        "Questions": _normalize_string_list(payload.get("Questions") or payload.get("questions")),
+        "Soundness": soundness,
+        "Presentation": presentation,
+        "Contribution": contribution,
+        "Overall": overall,
+        "Confidence": confidence,
+        "Decision": decision,
+    }
+
+
+logger = logging.getLogger(__name__)
+
+
+async def run_peer_review_ensemble(
+    manuscript_text: str,
+    *,
+    num_reviews_ensemble: int = 5,
+    pessimistic: bool = True,
+    llm_model: str | None = None,
+    llm_api_base: str | None = None,
+    llm_api_key: str | None = None,
+) -> dict[str, Any]:
+    """Run N-way reviewer ensemble with pessimistic prompt and Area Chair score aggregation."""
+    ensemble_size = max(1, min(5, int(num_reviews_ensemble)))
+    system_prompt = (
+        REVIEWER_SYSTEM_PROMPT_NEG
+        if pessimistic
+        else REVIEWER_SYSTEM_PROMPT_NEG.replace(
+            "if a paper is flawed, lacks traceable evidence, or you are unsure of its validity, give it bad scores and reject it!",
+            "evaluate the paper fairly and objectively.",
+        )
+    )
+    truncated_manuscript = manuscript_text[:12000]
+
+    async def _run_single_review(idx: int) -> dict[str, Any] | None:
+        try:
+            raw_resp = await complete_llm_response(
+                [
+                    {"role": "system", "content": system_prompt},
+                    {
+                        "role": "user",
+                        "content": (
+                            f"Reviewer #{idx + 1}/{ensemble_size}. Review this manuscript:\n\n"
+                            f"{truncated_manuscript}"
+                        ),
+                    },
+                ],
+                model=llm_model,
+                api_base=llm_api_base,
+                api_key=llm_api_key,
+                max_tokens=1600,
+            )
+        except Exception as exc:
+            logger.warning("Reviewer #%s failed during ensemble call: %s", idx + 1, exc)
+            return None
+
+        parsed = _parse_json_object(
+            raw_resp,
+            fallback={},
+            raw_field="raw_review",
+        )
+        has_review_key = any(
+            k in parsed
+            for k in ("Overall", "overall", "Soundness", "soundness", "Summary", "summary")
+        )
+        if not has_review_key:
+            logger.warning("Reviewer #%s returned unparseable review payload", idx + 1)
+            return None
+        return _normalize_peer_review_scorecard(parsed)
+
+    review_results = await asyncio.gather(
+        *[_run_single_review(idx) for idx in range(ensemble_size)]
+    )
+    individual_reviews = [r for r in review_results if r is not None]
+    if not individual_reviews:
+        raise ValueError("Peer review ensemble produced no valid reviewer JSON")
+
+    if len(individual_reviews) == 1:
+        aggregated = dict(individual_reviews[0])
+        aggregated["ensemble_size"] = 1
+        aggregated["individual_reviews"] = individual_reviews
+        return aggregated
+
+    meta_raw = await complete_llm_response(
+        [
+            {"role": "system", "content": AREA_CHAIR_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": (
+                    f"Aggregate these {len(individual_reviews)} reviewer reports into a meta-review JSON:\n"
+                    f"{json.dumps(individual_reviews, ensure_ascii=False)}"
+                ),
+            },
+        ],
+        model=llm_model,
+        api_base=llm_api_base,
+        api_key=llm_api_key,
+        max_tokens=1600,
+    )
+    meta_parsed = _parse_json_object(
+        meta_raw,
+        fallback=dict(individual_reviews[0]),
+        raw_field="raw_meta_review",
+    )
+    meta_norm = _normalize_peer_review_scorecard(meta_parsed)
+
+    # Numeric scores are aggregated by ensemble mean (per AI-Scientist perform_review.py:169-189)
+    for score_key, low, high in (
+        ("Soundness", 1, 4),
+        ("Presentation", 1, 4),
+        ("Contribution", 1, 4),
+        ("Overall", 1, 10),
+        ("Confidence", 1, 5),
+    ):
+        vals = [r[score_key] for r in individual_reviews]
+        mean_val = round(sum(vals) / len(vals), 2)
+        meta_norm[score_key] = mean_val
+    meta_norm["Decision"] = (
+        "Accept"
+        if str(meta_parsed.get("Decision") or "").strip().lower() == "accept"
+        and meta_norm["Overall"] >= 5.5
+        else "Reject"
+    )
+    meta_norm["ensemble_size"] = len(individual_reviews)
+    meta_norm["individual_reviews"] = individual_reviews
+    return meta_norm
+

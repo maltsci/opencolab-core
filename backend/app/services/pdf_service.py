@@ -1,9 +1,11 @@
 import asyncio
+import base64
 import json
 import logging
 import queue
 import threading
 import time
+from collections import Counter
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -37,7 +39,8 @@ def extract_pdf_document_metadata(file_path: str) -> dict[str, str]:
     try:
         import fitz
 
-        with fitz.open(file_path) as document:
+        resolved = str(resolve_file_path(file_path, allow_legacy_absolute=True))
+        with fitz.open(resolved) as document:
             raw_metadata = document.metadata or {}
     except Exception as exc:
         logger.warning(
@@ -111,7 +114,20 @@ async def parse_pdf(file_path: str) -> str:
                 type(exc).__name__,
             )
 
-    return _parse_pdf_locally(resolved)
+    local_text = _parse_pdf_locally(resolved)
+    if len(local_text.strip()) < 100:
+        boilerplate_lines, _page_count, image_pages_count = _detect_repeated_page_boilerplate(
+            resolved
+        )
+        if image_pages_count > 0:
+            ocr_text = await _ocr_scanned_pdf_if_needed(
+                resolved,
+                boilerplate_lines=boilerplate_lines,
+                min_size=100,
+            )
+            if ocr_text.strip() and len(ocr_text.strip()) >= len(local_text.strip()):
+                return ocr_text
+    return local_text
 
 
 def _parse_pdf_locally(resolved: str) -> str:
@@ -348,16 +364,373 @@ def _parse_with_marker_timeout(
     return str(payload)
 
 
-def _fallback_extract(file_path: str) -> str:
-    """Basic fallback if marker is not available."""
+def _is_structural_markdown_line(norm: str) -> bool:
+    if not norm:
+        return True
+    if norm in {"---", "***", "___"} or set(norm) <= {"-", "=", "_", "*", "|", " ", ":"}:
+        return True
+    if norm.startswith("|") and norm.endswith("|"):
+        return True
+    if norm.startswith("<!-- page ") and norm.endswith("-->"):
+        return True
+    return False
+
+
+def _detect_repeated_page_boilerplate(file_path: str) -> tuple[set[str], int, int]:
+    """Detect repeated cross-page header/footer/watermark lines and scanned image pages."""
+    try:
+        import fitz
+
+        with fitz.open(file_path) as doc:
+            page_count = len(doc)
+            image_pages_count = 0
+            non_empty_page_texts: list[str] = []
+            line_page_counts: Counter[str] = Counter()
+
+            for page in doc:
+                try:
+                    if page.get_images():
+                        image_pages_count += 1
+                except Exception:
+                    pass
+                raw_page_text = (page.get_text() or "").strip()
+                if not raw_page_text:
+                    continue
+                non_empty_page_texts.append(raw_page_text)
+                if page_count >= 3:
+                    page_norms = {
+                        norm
+                        for line in raw_page_text.splitlines()
+                        if len(norm := " ".join(line.split()).strip()) >= 6
+                    }
+                    for norm in page_norms:
+                        line_page_counts[norm] += 1
+    except Exception:
+        return set(), 0, 0
+
+    boilerplate_lines: set[str] = set()
+    if page_count >= 3:
+        threshold = max(3, int(page_count * 0.25))
+        boilerplate_lines = {
+            norm for norm, cnt in line_page_counts.items() if cnt >= threshold
+        }
+        if len(non_empty_page_texts) >= 3 and len(set(non_empty_page_texts)) == 1:
+            for line in non_empty_page_texts[0].splitlines():
+                norm = " ".join(line.split()).strip()
+                if norm:
+                    boilerplate_lines.add(norm)
+
+    return boilerplate_lines, page_count, image_pages_count
+
+
+def _deduplicate_repeated_text(
+    text: str,
+    boilerplate_lines: set[str] | None = None,
+) -> str:
+    """Strip cross-page spam watermarks and collapse heavily repeated lines."""
+    if not text or not text.strip():
+        return ""
+
+    boilerplate = set(boilerplate_lines or ())
+    lines = text.splitlines()
+    line_counts: Counter[str] = Counter()
+    non_empty_norms: list[str] = []
+
+    for line in lines:
+        norm = " ".join(line.split()).strip()
+        if not norm:
+            continue
+        non_empty_norms.append(norm)
+        if len(norm) >= 8 and not _is_structural_markdown_line(norm):
+            line_counts[norm] += 1
+
+    repeated_norms = {norm for norm, cnt in line_counts.items() if cnt >= 3} | boilerplate
+    if not repeated_norms:
+        return text
+
+    repeated_hits = sum(1 for norm in non_empty_norms if norm in repeated_norms)
+    is_watermark_dominated = bool(non_empty_norms) and (
+        repeated_hits * 2 >= len(non_empty_norms)
+    )
+
+    filtered: list[str] = []
+    seen_repeated: set[str] = set()
+    prev_non_empty_norm: str | None = None
+    for line in lines:
+        norm = " ".join(line.split()).strip()
+        if not norm:
+            if filtered and filtered[-1] != "":
+                filtered.append("")
+            continue
+        if norm in repeated_norms:
+            if is_watermark_dominated or norm in boilerplate:
+                continue
+            if norm in seen_repeated or norm == prev_non_empty_norm:
+                continue
+            seen_repeated.add(norm)
+        elif norm == prev_non_empty_norm and len(norm) >= 8 and not _is_structural_markdown_line(norm):
+            continue
+        filtered.append(line)
+        prev_non_empty_norm = norm
+
+    while filtered and filtered[0] == "":
+        filtered.pop(0)
+    while filtered and filtered[-1] == "":
+        filtered.pop()
+    return "\n".join(filtered)
+
+
+async def _resolve_ocr_llm_config() -> tuple[str | None, str | None, str | None]:
+    """Resolve active LLM credentials from DB runtime_config first, falling back to static settings."""
+    model = settings.llm_model
+    api_base = settings.llm_api_base
+    api_key = settings.llm_api_key
+
+    try:
+        from app.core.database import async_session_factory
+        from app.services.runtime_config import get_runtime_llm_api_key, get_runtime_value
+
+        async with async_session_factory() as db:
+            db_model = await get_runtime_value("llm_model", db)
+            db_api_base = await get_runtime_value("llm_api_base", db)
+            db_api_key = await get_runtime_llm_api_key(db)
+            if db_model:
+                model = db_model
+            if db_api_base:
+                api_base = db_api_base
+            if db_api_key:
+                api_key = db_api_key
+    except Exception as exc:
+        logger.debug("Unable to resolve runtime LLM config from DB: %s", exc)
+
+    if model and model.startswith("openai/"):
+        model = model.removeprefix("openai/")
+    return model, api_base, api_key
+
+
+def _select_scanned_ocr_page_indices(page_count: int) -> list[int]:
+    if page_count <= 0:
+        return []
+    if page_count <= 12:
+        return list(range(page_count))
+    front = [i for i in (0, 1, 2, 4, 6, 8, 9, 10, 11) if i < page_count]
+    tail_span = page_count - 12
+    step = max(1, tail_span // 4)
+    body = [min(page_count - 1, 12 + step * k) for k in (1, 2, 3)]
+    return sorted(set(front + body))[:12]
+
+
+async def _ocr_scanned_pdf_if_needed(
+    file_path: str,
+    *,
+    boilerplate_lines: set[str] | None = None,
+    min_size: int = 100,
+) -> str:
+    """Transcribe representative scanned PDF pages via the configured vision LLM when no text layer exists."""
+    model, api_base, api_key = await _resolve_ocr_llm_config()
+    if not model or not api_base or not api_key:
+        return ""
+
+    try:
+        import fitz
+
+        rendered_pages: list[tuple[int, str]] = []
+        with fitz.open(file_path) as doc:
+            indices = _select_scanned_ocr_page_indices(len(doc))
+            for idx in indices:
+                pix = doc[idx].get_pixmap(matrix=fitz.Matrix(1.2, 1.2))
+                b64 = base64.b64encode(pix.tobytes("png")).decode()
+                rendered_pages.append((idx, b64))
+    except Exception as exc:
+        logger.warning(
+            "Unable to render scanned PDF pages for %s (%s)",
+            Path(file_path).name,
+            exc,
+        )
+        return ""
+
+    if not rendered_pages:
+        return ""
+
+    endpoint = f"{api_base.rstrip('/')}/chat/completions"
+    headers = {"Authorization": f"Bearer {api_key}"}
+    semaphore = asyncio.Semaphore(4)
+
+    async def _transcribe_page(
+        client: httpx.AsyncClient, page_idx: int, b64_png: str
+    ) -> tuple[int, str]:
+        payload = {
+            "model": model,
+            "reasoning_effort": "low",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "Directly transcribe the main text on this scanned page into clean "
+                                "Markdown. Ignore any advertising headers, footers, or watermarks. "
+                                "Do not add explanations."
+                            ),
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{b64_png}"},
+                        },
+                    ],
+                }
+            ],
+            "max_tokens": 1600,
+        }
+        async with semaphore:
+            try:
+                resp = await client.post(endpoint, headers=headers, json=payload)
+                resp.raise_for_status()
+                data = resp.json()
+                content = (
+                    ((data.get("choices") or [{}])[0].get("message") or {}).get("content")
+                    or ""
+                )
+                return page_idx, str(content).strip()
+            except Exception as exc:
+                logger.warning(
+                    "Vision OCR failed for %s page %d (%s)",
+                    Path(file_path).name,
+                    page_idx + 1,
+                    exc,
+                )
+                return page_idx, ""
+
+    try:
+        async with httpx.AsyncClient(timeout=35.0, trust_env=False) as client:
+            results = await asyncio.gather(
+                *[_transcribe_page(client, idx, b64) for idx, b64 in rendered_pages]
+            )
+    except Exception as exc:
+        logger.warning("Scanned PDF OCR aborted for %s (%s)", Path(file_path).name, exc)
+        return ""
+
+    sections = [
+        f"<!-- page {idx + 1} -->\n\n{text}"
+        for idx, text in sorted(results, key=lambda item: item[0])
+        if text
+    ]
+    if not sections:
+        return ""
+
+    combined = "\n\n---\n\n".join(sections)
+    cleaned = _deduplicate_repeated_text(combined, boilerplate_lines=boilerplate_lines)
+    if len(cleaned.strip()) < min_size:
+        logger.info(
+            "Scanned PDF OCR yielded %d chars (< %d) for %s",
+            len(cleaned.strip()),
+            min_size,
+            Path(file_path).name,
+        )
+    return cleaned
+
+
+def _fallback_extract(file_path: str, min_size: int = 100) -> str:
+    """Three-tier local PDF text extraction fallback (pymupdf4llm -> pymupdf -> pypdf) with min_size guard."""
+    boilerplate_lines, page_count, image_pages_count = (
+        _detect_repeated_page_boilerplate(file_path)
+    )
+    if page_count >= 3 and image_pages_count >= max(3, int(page_count * 0.8)):
+        try:
+            import fitz
+
+            with fitz.open(file_path) as doc:
+                raw_fitz_text = "".join(page.get_text() for page in doc)
+            if not _deduplicate_repeated_text(
+                raw_fitz_text, boilerplate_lines=boilerplate_lines
+            ):
+                logger.info(
+                    "Detected scanned image-only PDF (%d/%d image pages) for %s; skipping slow text extractors",
+                    image_pages_count,
+                    page_count,
+                    Path(file_path).name,
+                )
+                return ""
+        except Exception:
+            pass
+    best_short_text = ""
+    any_parser_available = False
+
+    # Tier 1: pymupdf4llm (preserves Markdown headings, tables, and academic structure)
+    try:
+        import pymupdf4llm  # type: ignore[import-not-found]
+
+        any_parser_available = True
+        raw_text = str(pymupdf4llm.to_markdown(file_path) or "")
+        text = _deduplicate_repeated_text(raw_text, boilerplate_lines=boilerplate_lines)
+        if len(text) >= min_size:
+            return text
+        if len(text) > len(best_short_text):
+            best_short_text = text
+        logger.warning(
+            "pymupdf4llm extracted fewer than %d chars (%d) for %s; falling back to pymupdf",
+            min_size,
+            len(text),
+            Path(file_path).name,
+        )
+    except ImportError:
+        pass
+    except Exception as exc:
+        logger.warning(
+            "pymupdf4llm failed for %s (%s); falling back to pymupdf",
+            Path(file_path).name,
+            exc,
+        )
+
+    # Tier 2: pymupdf (fitz) direct page text extraction
     try:
         import fitz  # PyMuPDF
 
-        doc = fitz.open(file_path)
-        text = ""
-        for page in doc:
-            text += page.get_text()
-        doc.close()
-        return text
+        any_parser_available = True
+        with fitz.open(file_path) as doc:
+            raw_text = "".join(page.get_text() for page in doc)
+        text = _deduplicate_repeated_text(raw_text, boilerplate_lines=boilerplate_lines)
+        if len(text) >= min_size:
+            return text
+        if len(text) > len(best_short_text):
+            best_short_text = text
+        logger.warning(
+            "pymupdf extracted fewer than %d chars (%d) for %s; falling back to pypdf",
+            min_size,
+            len(text),
+            Path(file_path).name,
+        )
     except ImportError:
-        return f"[PDF parsing unavailable for {Path(file_path).name}]"
+        pass
+    except Exception as exc:
+        logger.warning(
+            "pymupdf failed for %s (%s); falling back to pypdf",
+            Path(file_path).name,
+            exc,
+        )
+
+    # Tier 3: pypdf fallback
+    try:
+        from pypdf import PdfReader  # type: ignore[import-not-found]
+
+        any_parser_available = True
+        reader = PdfReader(file_path)
+        raw_text = "".join((page.extract_text() or "") for page in reader.pages)
+        text = _deduplicate_repeated_text(raw_text, boilerplate_lines=boilerplate_lines)
+        if len(text) >= min_size:
+            return text
+        if len(text) > len(best_short_text):
+            best_short_text = text
+    except ImportError:
+        pass
+    except Exception as exc:
+        logger.warning(
+            "pypdf failed for %s (%s)",
+            Path(file_path).name,
+            exc,
+        )
+
+    if best_short_text or any_parser_available:
+        return best_short_text
+    return f"[PDF parsing unavailable for {Path(file_path).name}]"

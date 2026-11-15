@@ -3,26 +3,34 @@ import hashlib
 from datetime import datetime, timedelta, timezone
 
 from cryptography.fernet import Fernet, InvalidToken
-from jose import JWTError, jwt
-from passlib.context import CryptContext
 
 from app.core.config import settings
 
-pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
 ALGORITHM = "HS256"
 API_KEY_ENCRYPTION_PREFIX = "fernet:v1:"
+_pwd_context = None
+
+
+def _get_pwd_context():
+    global _pwd_context
+    if _pwd_context is None:
+        from passlib.context import CryptContext
+
+        _pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+    return _pwd_context
 
 
 def hash_password(password: str) -> str:
-    return pwd_context.hash(password)
+    return _get_pwd_context().hash(password)
 
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
-    return pwd_context.verify(plain_password, hashed_password)
+    return _get_pwd_context().verify(plain_password, hashed_password)
 
 
 def create_access_token(subject: str) -> str:
+    from jose import jwt
+
     expire = datetime.now(timezone.utc) + timedelta(
         minutes=settings.access_token_expire_minutes
     )
@@ -31,6 +39,8 @@ def create_access_token(subject: str) -> str:
 
 
 def create_source_preview_token(user_id: str, source_id: str) -> str:
+    from jose import jwt
+
     expire = datetime.now(timezone.utc) + timedelta(minutes=5)
     to_encode = {
         "sub": user_id,
@@ -42,6 +52,8 @@ def create_source_preview_token(user_id: str, source_id: str) -> str:
 
 
 def decode_access_token(token: str) -> str | None:
+    from jose import JWTError, jwt
+
     try:
         payload = jwt.decode(token, settings.secret_key, algorithms=[ALGORITHM])
         return payload.get("sub")
@@ -50,6 +62,8 @@ def decode_access_token(token: str) -> str | None:
 
 
 def decode_source_preview_token(token: str, source_id: str) -> str | None:
+    from jose import JWTError, jwt
+
     try:
         payload = jwt.decode(token, settings.secret_key, algorithms=[ALGORITHM])
     except JWTError:

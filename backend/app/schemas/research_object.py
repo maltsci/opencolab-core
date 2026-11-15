@@ -7,7 +7,15 @@ from pydantic import BaseModel, Field, field_validator
 class ResearchObjectCreate(BaseModel):
     session_id: str
     message_id: str | None = None
-    type: Literal["hypothesis", "discussion"]
+    type: Literal[
+        "hypothesis",
+        "discussion",
+        "research_question",
+        "baseline_scheme",
+        "experiment_protocol",
+        "experiment_iteration",
+        "manuscript_draft",
+    ]
     title: str | None = Field(default=None, max_length=500)
     content: str | None = None
     content_json: dict = Field(default_factory=dict)

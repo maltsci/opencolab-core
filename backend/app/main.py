@@ -29,6 +29,7 @@ from app.api.research_objects import router as research_objects_router
 from app.api.research_threads import router as research_threads_router
 from app.api.sessions import router as sessions_router
 from app.api.sources import router as sources_router
+from app.api.superagent import router as superagent_router
 from app.api.tags import router as tags_router
 from app.api.tasks import router as tasks_router
 from app.api.training import router as training_router
@@ -91,6 +92,7 @@ app.include_router(health_router, prefix=api)
 app.include_router(auth_router, prefix=api)
 app.include_router(admin_router, prefix=api)
 app.include_router(projects_router, prefix=api)
+app.include_router(superagent_router, prefix=api)
 app.include_router(project_plans_router, prefix=api)
 app.include_router(project_activities_router, prefix=api)
 app.include_router(sessions_router, prefix=api)

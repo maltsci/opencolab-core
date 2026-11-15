@@ -33,6 +33,7 @@ from app.models.research_direction_link import (
 )
 from app.models.research_group import ResearchGroup, ResearchGroupMember
 from app.models.research_object import ResearchObject, ResearchObjectRelation
+from app.models.research_ticket import ProjectPolicy, ProjectTrigger, ResearchTicket
 from app.models.session import Session
 from app.models.skill_pack import SkillPackRecord
 from app.models.source import Chunk, HiddenSource, SessionSource, Source, SourceMember, SourceShare, WorkspaceSource
@@ -96,6 +97,9 @@ __all__ = [
     "ResearchTrace",
     "ResearchObject",
     "ResearchObjectRelation",
+    "ProjectPolicy",
+    "ProjectTrigger",
+    "ResearchTicket",
     "SkillPackRecord",
     "Message",
     "MemberProfile",

@@ -236,3 +236,96 @@ def test_surya_ocr_config_get_text_config_prefers_decoder_by_default():
     assert cfg.get_text_config() == decoder
     assert cfg.get_text_config(decoder=True) == decoder
     assert cfg.get_text_config(encoder=True) == text_encoder
+
+
+def test_fallback_extract_cascades_three_tiers_with_min_size_guard(monkeypatch, tmp_path):
+    pdf_path = tmp_path / "cascade.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\n")
+
+    # Tier 1 returns too-short text (< 100 chars), Tier 2 fails, Tier 3 returns >= 100 chars
+    fake_pymupdf4llm = types.ModuleType("pymupdf4llm")
+    fake_pymupdf4llm.to_markdown = lambda _path: "short md"
+
+    fake_fitz = types.ModuleType("fitz")
+
+    def failing_open(_path):
+        raise RuntimeError("corrupt fitz stream")
+
+    fake_fitz.open = failing_open
+
+    fake_pypdf = types.ModuleType("pypdf")
+
+    class FakePage:
+        def extract_text(self):
+            return "A" * 120
+
+    class FakeReader:
+        def __init__(self, _path):
+            self.pages = [FakePage()]
+
+    fake_pypdf.PdfReader = FakeReader
+
+    monkeypatch.setitem(sys.modules, "pymupdf4llm", fake_pymupdf4llm)
+    monkeypatch.setitem(sys.modules, "fitz", fake_fitz)
+    monkeypatch.setitem(sys.modules, "pypdf", fake_pypdf)
+
+    extracted = pdf_service._fallback_extract(str(pdf_path), min_size=100)
+    assert extracted == "A" * 120
+
+
+def test_fallback_extract_strips_repeated_page_watermarks(monkeypatch, tmp_path):
+    pdf_path = tmp_path / "watermarked_scan.pdf"
+    pdf_path.write_bytes(b"%PDF-1.4\n")
+
+    watermark = (
+        "最低的手续费是期货交易成功的第一步 全国最低手续费免费办理期货开户\n"
+        "全国免费服务热线:400-6712-881 联系:曾经理 网址:www.7help.net"
+    )
+    repeated_text = "\n".join([watermark] * 20)
+
+    fake_pymupdf4llm = types.ModuleType("pymupdf4llm")
+    fake_pymupdf4llm.to_markdown = lambda _path: repeated_text
+
+    class FakePage:
+        def get_images(self):
+            return [(1,)]
+
+        def get_text(self):
+            return watermark
+
+    class FakeDoc:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def __len__(self):
+            return 20
+
+        def __iter__(self):
+            return iter([FakePage() for _ in range(20)])
+
+    fake_fitz = types.ModuleType("fitz")
+    fake_fitz.open = lambda _path: FakeDoc()
+
+    fake_pypdf = types.ModuleType("pypdf")
+
+    class FakePypdfPage:
+        def extract_text(self):
+            return watermark
+
+    class FakeReader:
+        def __init__(self, _path):
+            self.pages = [FakePypdfPage() for _ in range(20)]
+
+    fake_pypdf.PdfReader = FakeReader
+
+    monkeypatch.setitem(sys.modules, "pymupdf4llm", fake_pymupdf4llm)
+    monkeypatch.setitem(sys.modules, "fitz", fake_fitz)
+    monkeypatch.setitem(sys.modules, "pypdf", fake_pypdf)
+
+    extracted = pdf_service._fallback_extract(str(pdf_path), min_size=100)
+    assert extracted == ""
+
+

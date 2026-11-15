@@ -387,6 +387,7 @@ async def execute_skill_pack_run(
     goal: str,
     task_id: str | None = None,
     source_ids: list[str] | None = None,
+    require_approval: bool = False,
 ) -> OrchestrationRun:
     """Run a skill-pack-bound task inside the codex sandbox workspace."""
     session = await _get_authorized_session(db=db, session_id=session_id, user=user)
@@ -466,6 +467,16 @@ async def execute_skill_pack_run(
             user=user,
             target_status="running",
         )
+        if require_approval:
+            await transition_orchestration_run(
+                db=db,
+                run_id=run.id,
+                user=user,
+                target_status="waiting_for_approval",
+            )
+            await db.commit()
+            await db.refresh(run)
+            return run
     except Exception as exc:
         run.status = "failed"
         run.error_code = "skill_pack_prep_failed"
@@ -568,3 +579,202 @@ async def get_session_run_progress(
         "final_message_id": run.final_message_id,
         "events": events,
     }
+
+
+MAX_ITERS = 4
+MAX_RUNS = 5
+MAX_STDERR_OUTPUT = 1500
+
+SEIR_EXPERIMENT_TEMPLATE = """import argparse
+import json
+import math
+from pathlib import Path
+
+def solve_seir(beta=0.35, sigma=0.2, gamma=0.1, days=160, dt=0.1):
+    s, e, i, r = 0.999, 0.001, 0.0, 0.0
+    peak_infected = 0.0
+    peak_day = 0.0
+    steps = int(days / dt)
+    for step in range(steps):
+        ds = -beta * s * i
+        de = beta * s * i - sigma * e
+        di = sigma * e - gamma * i
+        dr = gamma * i
+        s += ds * dt
+        e += de * dt
+        i += di * dt
+        r += dr * dt
+        if i > peak_infected:
+            peak_infected = i
+            peak_day = round(step * dt, 2)
+    return {
+        "peak_infected_fraction": round(peak_infected, 6),
+        "peak_day": peak_day,
+        "final_recovered_fraction": round(r, 6),
+        "r0_estimate": round(beta / gamma, 4),
+    }
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--out_dir", type=str, default="run_0")
+    args = parser.parse_args()
+    out_path = Path(args.out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+    metrics = solve_seir()
+    final_info = {"seir_baseline": {"means": metrics}}
+    (out_path / "final_info.json").write_text(json.dumps(final_info, indent=2), encoding="utf-8")
+"""
+
+
+def scaffold_seir_offline_template(workspace_dir: str | Path) -> dict[str, str]:
+    """Scaffold the strict AI-Scientist SEIR offline template contract (prompt.json, seed_ideas.json, experiment.py, run_0/final_info.json)."""
+    import subprocess
+    import sys
+
+    ws = Path(workspace_dir)
+    ws.mkdir(parents=True, exist_ok=True)
+    prompt_json = {
+        "system": "You are an epidemiological modeling researcher investigating infectious disease dynamics with SEIR ODE models.",
+        "task_description": "Explore parameterizations and interventions in an SEIR differential equation model (--out_dir=run_N -> final_info.json).",
+    }
+    seed_ideas = [
+        {
+            "Name": "seir_quarantine_decay",
+            "Title": "Time-Varying Transmission Rate under Staged Quarantine in SEIR Dynamics",
+            "Experiment": "Modify solve_seir() to incorporate a time-decaying beta(t) after peak threshold and compare peak_infected_fraction.",
+            "Interestingness": 8,
+            "Feasibility": 9,
+            "Novelty": 7,
+        }
+    ]
+    (ws / "prompt.json").write_text(json.dumps(prompt_json, indent=2), encoding="utf-8")
+    (ws / "seed_ideas.json").write_text(json.dumps(seed_ideas, indent=2), encoding="utf-8")
+    exp_file = ws / "experiment.py"
+    if not exp_file.exists():
+        exp_file.write_text(SEIR_EXPERIMENT_TEMPLATE, encoding="utf-8")
+
+    # Pre-generate run_0/final_info.json baseline (resolving the missing run_0 pitfall)
+    run0_info = ws / "run_0" / "final_info.json"
+    if not run0_info.exists():
+        subprocess.run(
+            [sys.executable, str(exp_file), "--out_dir=run_0"],
+            cwd=str(ws),
+            check=True,
+            timeout=30,
+        )
+    return {
+        "workspace_dir": str(ws),
+        "experiment_py": str(exp_file),
+        "baseline_final_info": str(run0_info),
+    }
+
+
+async def run_bounded_experiment_loop(
+    *,
+    workspace_dir: str | Path,
+    idea: dict[str, Any],
+    max_runs: int = MAX_RUNS,
+    max_iters: int = MAX_ITERS,
+    timeout_seconds: int = 120,
+    repair_callback=None,
+    allow_host_execution: bool = False,
+) -> dict[str, Any]:
+    """Bounded retry experiment loop (MAX_ITERS=4, MAX_RUNS=5, stderr[-1500:]) with run_N.py SHA-256 snapshot and final_info.json.
+
+    WARNING: this executes experiment.py with a host subprocess, NOT inside the codex
+    sandbox. It must not be wired to LLM-written code from an API request path until it
+    is moved behind the sandbox runtime and the waiting_for_approval gate. Callers must
+    opt in explicitly with allow_host_execution=True.
+    """
+    if not allow_host_execution:
+        raise PermissionError(
+            "run_bounded_experiment_loop executes code on the host; pass allow_host_execution=True explicitly"
+        )
+    import hashlib
+    import shutil
+    import subprocess
+    import sys
+
+    ws = Path(workspace_dir)
+    exp_file = ws / "experiment.py"
+    if not exp_file.exists():
+        scaffold_seir_offline_template(ws)
+
+    runs_limit = max(1, min(MAX_RUNS, int(max_runs)))
+    iters_limit = max(1, min(MAX_ITERS, int(max_iters)))
+    snapshots: list[dict[str, Any]] = []
+    results_by_run: dict[str, Any] = {}
+    notes_entries: list[str] = []
+
+    for run_num in range(1, runs_limit + 1):
+        run_Succeeded = False
+        for iter_idx in range(iters_limit):
+            # Snapshot experiment.py -> run_{run_num}.py before execution for AssetRevision / provenance reproducibility
+            snapshot_file = ws / f"run_{run_num}.py"
+            shutil.copyfile(exp_file, snapshot_file)
+            digest = hashlib.sha256(snapshot_file.read_bytes()).hexdigest()
+
+            out_dir = ws / f"run_{run_num}"
+            proc = subprocess.run(
+                [sys.executable, "experiment.py", f"--out_dir=run_{run_num}"],
+                cwd=str(ws),
+                capture_output=True,
+                text=True,
+                timeout=timeout_seconds,
+            )
+            if proc.returncode == 0 and (out_dir / "final_info.json").exists():
+                raw_info = json.loads((out_dir / "final_info.json").read_text(encoding="utf-8"))
+                means_summary = {
+                    k: v.get("means", v) if isinstance(v, dict) else v
+                    for k, v in raw_info.items()
+                }
+                snapshots.append(
+                    {
+                        "run_num": run_num,
+                        "snapshot_file": f"run_{run_num}.py",
+                        "sha256_digest": digest,
+                        "attempt": iter_idx + 1,
+                        "status": "completed",
+                    }
+                )
+                results_by_run[f"run_{run_num}"] = means_summary
+                notes_entries.append(
+                    f"Run {run_num} (sha256:{digest[:12]}): {json.dumps(means_summary, ensure_ascii=False)}"
+                )
+                run_Succeeded = True
+                break
+
+            # On failure: truncate stderr to MAX_STDERR_OUTPUT (1500 chars), clean partial run_N dir, and invoke repair callback
+            stderr_tail = (proc.stderr or proc.stdout or "Execution failed")[-MAX_STDERR_OUTPUT:]
+            if out_dir.exists():
+                shutil.rmtree(out_dir)
+            if repair_callback is not None:
+                repaired_code = await repair_callback(
+                    run_num=run_num,
+                    attempt=iter_idx + 1,
+                    stderr_tail=stderr_tail,
+                    current_code=exp_file.read_text(encoding="utf-8"),
+                )
+                if isinstance(repaired_code, str) and repaired_code.strip():
+                    exp_file.write_text(repaired_code, encoding="utf-8")
+            else:
+                break
+
+        if not run_Succeeded:
+            break
+
+    notes_path = ws / "notes.txt"
+    notes_path.write_text(
+        f"# Title: {idea.get('Title') or idea.get('title') or 'Bounded Experiment Run'}\n"
+        + "\n".join(notes_entries)
+        + "\n",
+        encoding="utf-8",
+    )
+    return {
+        "idea_name": idea.get("Name") or idea.get("name") or "experiment",
+        "runs_completed": len(results_by_run),
+        "snapshots": snapshots,
+        "results": results_by_run,
+        "notes_file": str(notes_path),
+    }
+

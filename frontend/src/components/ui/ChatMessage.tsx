@@ -2,8 +2,11 @@ import { MoreOutlined, RobotOutlined, UserOutlined } from '@ant-design/icons';
 import { Button, Dropdown, Typography, theme } from 'antd';
 import { memo, type ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
+import 'katex/dist/katex.min.css';
 import ReactMarkdown, { defaultUrlTransform } from 'react-markdown';
+import rehypeKatex from 'rehype-katex';
 import remarkGfm from 'remark-gfm';
+import remarkMath from 'remark-math';
 
 export interface ChatMessageAction {
   key: string;
@@ -72,7 +75,8 @@ export const MarkdownContent = memo(function MarkdownContent({
 
   return (
     <ReactMarkdown
-      remarkPlugins={[remarkGfm]}
+      remarkPlugins={[remarkGfm, remarkMath]}
+      rehypePlugins={[rehypeKatex]}
       urlTransform={markdownUrlTransform}
       components={{
         h1: ({ children: headingChildren }) => (

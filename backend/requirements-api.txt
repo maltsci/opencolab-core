@@ -23,8 +23,9 @@ litellm==1.60.2
 # Vector store
 qdrant-client==1.13.3
 
-# PDF thumbnail (lightweight, ~30 MB)
+# PDF thumbnail & manuscript export
 PyMuPDF>=1.24.0
+python-docx>=1.1,<2
 
 # Utilities
 httpx>=0.23.0,<0.28.0

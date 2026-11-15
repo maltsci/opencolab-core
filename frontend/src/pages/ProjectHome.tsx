@@ -8,6 +8,7 @@ import PageContainer from '../components/library/PageContainer';
 import ProjectActivityTab from '../components/project/ProjectActivityTab';
 import ProjectConfigPanel from '../components/project/ProjectConfigPanel';
 import ProjectPlansTab from '../components/project/ProjectPlansTab';
+import ProjectSuperagentTab from '../components/project/ProjectSuperagentTab';
 import ProjectTasksTab from '../components/project/ProjectTasksTab';
 import ProjectAssets from './ProjectAssets';
 import { ROLES_PRIVILEGED } from '../constants/roles';
@@ -15,7 +16,7 @@ import { useAuth } from '../hooks/useAuth';
 import apiClient from '../services/api-client';
 import type { Project } from '../types/project';
 
-const VALID_TABS = ['tasks', 'activity', 'plans', 'assets'];
+const VALID_TABS = ['overview', 'tasks', 'activity', 'plans', 'assets'];
 
 export default function ProjectHome() {
   const { t } = useTranslation();
@@ -29,7 +30,7 @@ export default function ProjectHome() {
   const [notFound, setNotFound] = useState(false);
 
   const tabParam = searchParams.get('tab');
-  const activeTab = tabParam && VALID_TABS.includes(tabParam) ? tabParam : 'tasks';
+  const activeTab = tabParam && VALID_TABS.includes(tabParam) ? tabParam : 'overview';
 
   const fetchProject = useCallback(() => {
     if (!projectId) return;
@@ -102,6 +103,13 @@ export default function ProjectHome() {
             activeKey={activeTab}
             onChange={(key) => setSearchParams({ tab: key }, { replace: true })}
             items={[
+              {
+                key: 'overview',
+                label: t('projectHome.tabSuperagentOverview'),
+                children: (
+                  <ProjectSuperagentTab project={project} canManage={canManage} />
+                ),
+              },
               {
                 key: 'tasks',
                 label: t('projectHome.tabSessions'),

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import Counter
 import re
 
 from sqlalchemy import select
@@ -244,7 +245,25 @@ async def rebuild_local_bibliographic_metadata_from_chunks(
 
 
 def _normalize_text(text: str) -> str:
-    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    raw_lines = [line.strip() for line in text.splitlines() if line.strip()]
+    counts = Counter(
+        line
+        for line in raw_lines
+        if len(line) >= 8
+        and not line.startswith("|")
+        and not set(line) <= {"-", "=", "_", "*", "|", " ", ":"}
+    )
+    repeated = {line for line, cnt in counts.items() if cnt >= 3}
+
+    lines: list[str] = []
+    prev_line: str | None = None
+    for line in raw_lines:
+        if line in repeated:
+            continue
+        if len(line) >= 8 and line == prev_line:
+            continue
+        lines.append(line)
+        prev_line = line
     return "\n".join(lines)
 
 
@@ -322,15 +341,21 @@ def _infer_document_type(source_name: str) -> str | None:
 
 
 def _split_sentences(normalized_text: str) -> list[str]:
-    body = normalized_text.replace("\n", " ").strip()
-    if not body:
+    cleaned = re.sub(r"<!--.*?-->", "\n", normalized_text, flags=re.DOTALL).strip()
+    if not cleaned:
         return []
 
-    parts = re.split(r"(?<=[.!?])\s+", body)
+    parts = re.split(r"(?:(?<=[.!?])\s+|(?<=[。！？；])\s*|\n+)", cleaned)
     sentences: list[str] = []
+    seen: set[str] = set()
     for part in parts:
-        sentence = part.strip()
-        if not sentence:
+        sentence = re.sub(r"^#+\s*", "", part.strip()).strip()
+        if not sentence or set(sentence) <= {"-", "=", "_", "*", "|", " ", ":"}:
             continue
+        if len(sentence) > 300:
+            sentence = sentence[:300]
+        if sentence in seen:
+            continue
+        seen.add(sentence)
         sentences.append(sentence)
     return sentences

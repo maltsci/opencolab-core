@@ -787,3 +787,175 @@ async def test_stream_llm_response_ignores_empty_provider_events(monkeypatch):
         chunks.append(token)
 
     assert chunks == ["ok"]
+
+
+@pytest.mark.asyncio
+async def test_literature_synthesizer_3d_scoring_and_reflection_early_stop(monkeypatch):
+    async def fake_retrieve_chunks(query, source_ids, db, mode, top_k=5, **_kwargs):
+        return [
+            {
+                "source_id": "source-1",
+                "chunk_id": "chunk-1",
+                "text": "Baseline evidence",
+                "score": 0.9,
+            }
+        ]
+
+    responses = iter(
+        [
+            '{"overview":"Initial view","key_points":["KP1"],"contradictions":[],"gaps":["G1"],'
+            '"hypotheses":[{"name":"idea_a","title":"Idea A","statement":"Test A","interestingness":6,"feasibility":7,"novelty":6},'
+            '{"name":"idea_b","title":"Idea B","statement":"Test B","interestingness":9,"feasibility":8,"novelty":9}]}',
+            '{"overview":"Refined view","key_points":["KP1"],"contradictions":[],"gaps":["G1"],'
+            '"hypotheses":[{"name":"idea_b","title":"Idea B","statement":"Refined Test B","interestingness":9,"feasibility":9,"novelty":9},'
+            '{"name":"idea_a","title":"Idea A","statement":"Test A","interestingness":6,"feasibility":7,"novelty":6}]}\nI am done',
+            '{"is_valid": true, "notes": ["converged and scored"]}',
+        ]
+    )
+    calls: list[list[dict]] = []
+
+    async def fake_complete_llm_response(messages, model=None, api_base=None, api_key=None, max_tokens=None):
+        calls.append(messages)
+        return next(responses)
+
+    monkeypatch.setattr(literature_synthesizer, "retrieve_chunks", fake_retrieve_chunks)
+    monkeypatch.setattr(
+        literature_synthesizer,
+        "complete_llm_response",
+        fake_complete_llm_response,
+    )
+
+    result = await run_agent_definition(
+        agent_name="literature_synthesizer",
+        source_ids=["source-1", "source-2"],
+        agent_input={
+            "query": "Generate and score hypotheses",
+            "num_reflections": 4,
+            "idea_archive": [{"title": "Old Idea 1"}],
+        },
+        db=None,
+        llm_model="model-x",
+        llm_api_base="http://localhost:4000",
+        llm_api_key="key-x",
+    )
+
+    # Should early-stop at round 2 because "I am done" was returned, so total LLM calls = 1 (initial) + 1 (reflection) + 1 (validation) = 3
+    assert len(calls) == 3
+    assert "Old Idea 1" in calls[0][1]["content"]
+    assert result["output"]["early_stopped"] is True
+    assert result["output"]["reflection_rounds"] == 2
+    hypotheses = result["output"]["hypotheses"]
+    assert len(hypotheses) == 2
+    assert hypotheses[0]["title"] == "Idea B"
+    assert hypotheses[0]["composite_score"] == 9.0
+    assert hypotheses[1]["title"] == "Idea A"
+
+
+@pytest.mark.asyncio
+async def test_autonomous_novelty_check_loop_air_gap_qdrant_only(monkeypatch):
+    async def fake_retrieve_chunks(query, source_ids, db, mode, top_k=5, **_kwargs):
+        return [
+            {
+                "source_id": "src-local",
+                "chunk_id": "c-1",
+                "text": f"Local paper abstract for query {query}",
+                "score": 0.85,
+            }
+        ]
+
+    replies = iter(
+        [
+            '{"Thought": "Search local corpus first", "Query": "graph attention equivariant"}',
+            '{"Thought": "The proposed mechanism is distinct from existing local papers."}\nDecision made: novel',
+        ]
+    )
+
+    async def fake_complete_llm(messages, model=None, api_base=None, api_key=None, max_tokens=None):
+        return next(replies)
+
+    monkeypatch.setattr(literature_synthesizer, "retrieve_chunks", fake_retrieve_chunks)
+    monkeypatch.setattr(literature_synthesizer, "complete_llm_response", fake_complete_llm)
+
+    idea = {"Name": "equivariant_gat", "Title": "Equivariant GAT with Dynamic Cutoff"}
+    checked = await literature_synthesizer.check_idea_novelty(
+        idea,
+        source_ids=["src-local"],
+        db=None,
+        max_num_iterations=5,
+        allow_external_lookup=False,
+    )
+    assert checked["novel"] is True
+    assert checked["novelty_check"]["decision_made"] is True
+    assert checked["novelty_check"]["rounds_used"] == 2
+    assert checked["novelty_check"]["queries"] == ["graph attention equivariant"]
+    assert checked["novelty_check"]["outbound_used"] is False
+
+
+@pytest.mark.asyncio
+async def test_peer_review_ensemble_and_iclr_spearman_calibration(monkeypatch):
+    from app.services.iclr_calibration_service import evaluate_review_calibration_metrics
+
+    responses = iter(
+        [
+            '{"Summary":"R1","Strengths":["S1"],"Weaknesses":["W1"],"Questions":[],"Soundness":3,"Presentation":3,"Contribution":3,"Overall":7,"Confidence":4,"Decision":"Accept"}',
+            '{"Summary":"R2","Strengths":["S1"],"Weaknesses":["W2"],"Questions":[],"Soundness":2,"Presentation":3,"Contribution":2,"Overall":5,"Confidence":3,"Decision":"Reject"}',
+            '{"Summary":"Meta","Strengths":["S1"],"Weaknesses":["W1"],"Questions":[],"Decision":"Accept"}',
+        ]
+    )
+
+    async def fake_complete_llm(messages, model=None, api_base=None, api_key=None, max_tokens=None):
+        return next(responses)
+
+    monkeypatch.setattr(reviewer_assistant, "complete_llm_response", fake_complete_llm)
+    ensemble_result = await reviewer_assistant.run_peer_review_ensemble(
+        "Sample manuscript text",
+        num_reviews_ensemble=2,
+        pessimistic=True,
+    )
+    assert ensemble_result["ensemble_size"] == 2
+    assert ensemble_result["Overall"] == 6.0
+    assert ensemble_result["Soundness"] == 2.5
+    assert ensemble_result["Decision"] == "Accept"
+
+    calib = evaluate_review_calibration_metrics(
+        human_decisions=[1, 0, 1, 0],
+        llm_decisions=[1, 0, 1, 0],
+        human_scores=[8.0, 4.0, 7.5, 3.5],
+        llm_scores=[7.5, 4.5, 7.0, 3.0],
+    )
+    assert calib["accuracy"] == 1.0
+    assert calib["f1"] == 1.0
+    assert calib["spearman_rho"] == 1.0
+
+
+@pytest.mark.asyncio
+async def test_bounded_experiment_loop_and_seir_offline_template(tmp_path):
+    from app.services.orchestration_service import (
+        run_bounded_experiment_loop,
+        scaffold_seir_offline_template,
+    )
+
+    scaffold_info = scaffold_seir_offline_template(tmp_path)
+    assert (tmp_path / "prompt.json").exists()
+    assert (tmp_path / "seed_ideas.json").exists()
+    assert (tmp_path / "run_0" / "final_info.json").exists()
+    assert scaffold_info["workspace_dir"] == str(tmp_path)
+
+    with pytest.raises(PermissionError):
+        await run_bounded_experiment_loop(workspace_dir=tmp_path, idea={})
+
+    loop_res = await run_bounded_experiment_loop(
+        workspace_dir=tmp_path,
+        idea={"Name": "seir_test", "Title": "SEIR Offline Test"},
+        max_runs=2,
+        max_iters=2,
+        allow_host_execution=True,
+    )
+    assert loop_res["runs_completed"] == 2
+    assert len(loop_res["snapshots"]) == 2
+    assert (tmp_path / "run_1.py").exists()
+    assert (tmp_path / "run_2.py").exists()
+    assert (tmp_path / "notes.txt").exists()
+    assert "seir_baseline" in loop_res["results"]["run_1"]
+
+
