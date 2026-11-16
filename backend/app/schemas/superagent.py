@@ -93,6 +93,7 @@ class TicketDeliverableSchema(BaseModel):
     checkpoint_stage: str | None = None
     idea_evaluation: dict[str, Any] | None = None
     peer_review: dict[str, Any] | None = None
+    critic_check: dict[str, Any] | None = None
 
 
 class DeepResearchLaunchRequest(BaseModel):

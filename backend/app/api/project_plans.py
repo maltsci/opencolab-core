@@ -131,6 +131,8 @@ async def create_plan(
         due_date=body.due_date,
         priority=body.priority,
         tags=body.tags,
+        stage_category=body.stage_category,
+        ticket_id=body.ticket_id,
         assignee_id=body.assignee_id,
         created_by=user.id,
     )

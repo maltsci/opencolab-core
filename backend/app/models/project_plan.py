@@ -22,6 +22,15 @@ class ProjectPlan(Base):
     due_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     priority: Mapped[str] = mapped_column(String(20), default="medium")
     tags: Mapped[list] = mapped_column(JSON, default=list, server_default="[]")
+    stage_category: Mapped[str | None] = mapped_column(
+        String(40), nullable=True, index=True
+    )
+    ticket_id: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey("research_tickets.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
     assignee_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True
     )

@@ -1,4 +1,4 @@
-import { Alert, Card, Progress, Space, Tag, Typography, theme } from 'antd';
+import { Alert, Button, Card, Progress, Space, Tag, Typography, theme } from 'antd';
 import { useTranslation } from 'react-i18next';
 
 import type { IdeaEvaluation, PeerReview } from '../../types/superagent';
@@ -159,7 +159,15 @@ function BulletList({ title, items }: { title: string; items?: string[] }) {
   );
 }
 
-export function PeerReviewCard({ review }: { review: PeerReview }) {
+export function PeerReviewCard({
+  review,
+  onSpawnRebuttal,
+  rebuttalLoading,
+}: {
+  review: PeerReview;
+  onSpawnRebuttal?: () => void;
+  rebuttalLoading?: boolean;
+}) {
   const { t } = useTranslation();
   const { token } = theme.useToken();
   const unscored = t('superagent.scorecard.unscored');
@@ -174,6 +182,19 @@ export function PeerReviewCard({ review }: { review: PeerReview }) {
     <Card
       size="small"
       style={{ background: token.colorBgContainer }}
+      extra={
+        onSpawnRebuttal && (
+          <Button
+            size="small"
+            type="primary"
+            ghost
+            loading={rebuttalLoading}
+            onClick={onSpawnRebuttal}
+          >
+            {t('superagent.scorecard.spawnRebuttalBtn')}
+          </Button>
+        )
+      }
       title={(
         <Space wrap>
           <Tag color="green">Writer Agent</Tag>

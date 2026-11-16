@@ -1,5 +1,5 @@
 import { ArrowLeftOutlined, DatabaseOutlined, RobotOutlined } from '@ant-design/icons';
-import { Button, Result, Space, Spin, Tabs, Tag, theme } from 'antd';
+import { Badge, Button, Result, Space, Spin, Tabs, Tag, theme } from 'antd';
 import { useCallback, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate, useParams, useSearchParams } from 'react-router-dom';
@@ -14,9 +14,9 @@ import ProjectAssets from './ProjectAssets';
 import { ROLES_PRIVILEGED } from '../constants/roles';
 import { useAuth } from '../hooks/useAuth';
 import apiClient from '../services/api-client';
-import type { Project } from '../types/project';
+import type { Project, ProjectTodosResponse } from '../types/project';
 
-const VALID_TABS = ['overview', 'tasks', 'activity', 'plans', 'assets'];
+const VALID_TABS = ['overview', 'plans', 'tasks', 'activity', 'assets'];
 
 export default function ProjectHome() {
   const { t } = useTranslation();
@@ -28,9 +28,26 @@ export default function ProjectHome() {
   const [project, setProject] = useState<Project | null>(null);
   const [loading, setLoading] = useState(true);
   const [notFound, setNotFound] = useState(false);
+  const [todosCount, setTodosCount] = useState(0);
+  const [activityRefreshKey, setActivityRefreshKey] = useState(0);
 
   const tabParam = searchParams.get('tab');
   const activeTab = tabParam && VALID_TABS.includes(tabParam) ? tabParam : 'overview';
+  const ticketParam = searchParams.get('ticket');
+  const stageParam = searchParams.get('stage');
+
+  const fetchTodosCount = useCallback(() => {
+    if (!projectId) return;
+    apiClient
+      .get<ProjectTodosResponse>(`/projects/${projectId}/superagent/todos`)
+      .then((r) => setTodosCount(r.data.total_count ?? 0))
+      .catch(() => undefined);
+  }, [projectId]);
+
+  const handleWorkspaceChanged = useCallback(() => {
+    fetchTodosCount();
+    setActivityRefreshKey((k) => k + 1);
+  }, [fetchTodosCount]);
 
   const fetchProject = useCallback(() => {
     if (!projectId) return;
@@ -47,6 +64,7 @@ export default function ProjectHome() {
   }, [projectId]);
 
   useEffect(fetchProject, [fetchProject]);
+  useEffect(fetchTodosCount, [fetchTodosCount]);
 
   if (notFound) {
     return (
@@ -107,23 +125,77 @@ export default function ProjectHome() {
                 key: 'overview',
                 label: t('projectHome.tabSuperagentOverview'),
                 children: (
-                  <ProjectSuperagentTab project={project} canManage={canManage} />
+                  <ProjectSuperagentTab
+                    project={project}
+                    canManage={canManage}
+                    initialTicketId={ticketParam}
+                    initialStage={stageParam}
+                    onClearDeepLink={() =>
+                      setSearchParams({ tab: 'overview' }, { replace: true })
+                    }
+                    onWorkspaceChanged={handleWorkspaceChanged}
+                  />
+                ),
+              },
+              {
+                key: 'plans',
+                label: (
+                  <Space size={6}>
+                    <span>{t('projectHome.tabPlans')}</span>
+                    {todosCount > 0 && <Badge count={todosCount} size="small" />}
+                  </Space>
+                ),
+                children: (
+                  <ProjectPlansTab
+                    project={project}
+                    canManage={canManage}
+                    onOpenTicket={(ticketId) =>
+                      setSearchParams(
+                        { tab: 'overview', ticket: ticketId },
+                        { replace: true },
+                      )
+                    }
+                    onOpenStage={(stage) =>
+                      setSearchParams(
+                        { tab: 'overview', stage },
+                        { replace: true },
+                      )
+                    }
+                    onTodosChanged={handleWorkspaceChanged}
+                  />
                 ),
               },
               {
                 key: 'tasks',
                 label: t('projectHome.tabSessions'),
-                children: <ProjectTasksTab project={project} />,
+                children: (
+                  <ProjectTasksTab
+                    project={project}
+                    onOpenTicket={(ticketId) =>
+                      setSearchParams(
+                        { tab: 'overview', ticket: ticketId },
+                        { replace: true },
+                      )
+                    }
+                    onPrecipitated={handleWorkspaceChanged}
+                  />
+                ),
               },
               {
                 key: 'activity',
                 label: t('projectHome.tabActivity'),
-                children: <ProjectActivityTab project={project} />,
-              },
-              {
-                key: 'plans',
-                label: t('projectHome.tabPlans'),
-                children: <ProjectPlansTab project={project} canManage={canManage} />,
+                children: (
+                  <ProjectActivityTab
+                    project={project}
+                    refreshKey={activityRefreshKey}
+                    onSelectTicket={(ticketId) =>
+                      setSearchParams(
+                        { tab: 'overview', ticket: ticketId },
+                        { replace: true },
+                      )
+                    }
+                  />
+                ),
               },
               {
                 key: 'assets',

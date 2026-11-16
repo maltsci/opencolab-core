@@ -57,11 +57,164 @@ from app.services.agents.deep_research_graph import (
     planner_agent_node,
     writer_agent_node,
 )
-from app.services.research_asset_service import materialize_research_object_asset
+from app.services.file_storage import compute_file_hash, save_file
+from app.services.manuscript_export_service import render_manuscript_pdf
+from app.services.research_asset_service import (
+    materialize_research_object_asset,
+    materialize_source_asset,
+)
 from app.services.research_context import collect_project_source_ids
 from app.services.runtime_config import get_runtime_llm_api_key, get_runtime_value
 
 logger = logging.getLogger(__name__)
+
+
+def _run_stage_critic_check(
+    *,
+    stage_category: str,
+    deliverable: dict[str, Any],
+    sources_count: int = 0,
+) -> dict[str, Any]:
+    """Run a lightweight CoE-inspired Critic self-check before handing deliverables to human review."""
+    markdown_report = str(deliverable.get("markdown_report") or "")
+    metrics_table = list(deliverable.get("metrics_table") or [])
+    memory_cards = list(deliverable.get("literature_memory_cards") or [])
+    proposed_objects = list(deliverable.get("proposed_objects") or [])
+    checks: list[dict[str, Any]] = []
+
+    if stage_category == "baseline_reproduction":
+        checks = [
+            {
+                "key": "baseline_schemes",
+                "passed": len(metrics_table) > 0,
+            },
+            {
+                "key": "memory_cards",
+                "passed": len(memory_cards) > 0 or sources_count == 0,
+            },
+            {
+                "key": "report_gaps",
+                "passed": len(markdown_report.strip()) >= 80,
+            },
+        ]
+    elif stage_category == "manuscript_writing":
+        has_figures = any(
+            isinstance(obj, dict)
+            and isinstance(obj.get("content_json"), dict)
+            and bool(obj["content_json"].get("figures") or obj["content_json"].get("chart_svg"))
+            for obj in proposed_objects
+        )
+        checks = [
+            {
+                "key": "citation_grounding",
+                "passed": "[" in markdown_report and "]" in markdown_report,
+            },
+            {
+                "key": "latex_balanced",
+                "passed": markdown_report.count("$$") % 2 == 0,
+            },
+            {
+                "key": "figures_present",
+                "passed": has_figures,
+            },
+            {
+                "key": "peer_review_present",
+                "passed": bool(deliverable.get("peer_review")),
+            },
+        ]
+    else:
+        checks = [
+            {
+                "key": "report_present",
+                "passed": len(markdown_report.strip()) >= 40 or len(metrics_table) > 0,
+            }
+        ]
+
+    passed_count = sum(1 for c in checks if c["passed"])
+    checked_count = len(checks)
+    return {
+        "status": "passed" if passed_count == checked_count else "warning",
+        "passed_count": passed_count,
+        "checked_count": checked_count,
+        "checks": checks,
+    }
+
+
+async def _register_manuscript_pdf_in_materials(
+    db: AsyncSession,
+    *,
+    ticket: ResearchTicket,
+    title: str,
+    markdown_body: str,
+    figures: list[dict[str, Any]] | None = None,
+    chart_svg: str | None = None,
+    owner_id: str | None = None,
+) -> Source | None:
+    """Render a Stage 5 manuscript draft as PDF and register it in Project Materials."""
+    if not markdown_body.strip():
+        return None
+    combined_figures = list(figures or [])
+    if chart_svg and not any(fig.get("svg") == chart_svg for fig in combined_figures):
+        combined_figures.append(
+            {
+                "id": "chart-cross-validation",
+                "title": "Cross-Validation Chart",
+                "svg": chart_svg,
+            }
+        )
+    try:
+        pdf_bytes = render_manuscript_pdf(
+            title=title,
+            markdown_text=markdown_body,
+            figures=combined_figures or None,
+        )
+    except Exception as exc:
+        logger.warning("Failed to render manuscript PDF for materials: %s", exc)
+        return None
+
+    content_hash = compute_file_hash(pdf_bytes)
+    existing_source = await db.scalar(
+        select(Source).where(Source.content_hash == content_hash)
+    )
+    resolved_owner = owner_id or ticket.assignee_id or ticket.created_by
+    if existing_source is not None:
+        source = existing_source
+    else:
+        safe_stem = "".join(
+            ch if ch.isalnum() or ch in ("-", "_") else "_"
+            for ch in (title or ticket.short_key)[:60]
+        ).strip("_") or ticket.short_key
+        filename = f"{safe_stem}_{ticket.short_key}.pdf"
+        file_path = save_file(pdf_bytes, content_hash, filename)
+        source = Source(
+            type="file",
+            name=filename,
+            content_hash=content_hash,
+            content_path=file_path,
+            processing_state="ready",
+            progress=100,
+            owner_id=resolved_owner,
+        )
+        db.add(source)
+        await db.flush()
+        db.add(
+            Chunk(
+                source_id=source.id,
+                text=markdown_body[:20000],
+                chunk_index=0,
+            )
+        )
+
+    await materialize_source_asset(
+        db=db,
+        source=source,
+        owner_id=resolved_owner,
+        origin_project_id=ticket.project_id,
+        origin_session_id=None,
+        visibility_scope="project",
+        link_type="output",
+    )
+    return source
 
 
 STAGE_TO_OBJECT_TYPE: dict[str, str] = {
@@ -574,7 +727,7 @@ async def _execute_stage2_baseline_reproduction(
         f"compressed {len(memory_cards)} paper(s) into <=500-word Memory Cards with [Source_ID] bindings, "
         f"and reproduced {len(metrics_rows)} baseline workflow(s) in workspace."
     )
-    ticket.deliverable_json = {
+    stage2_deliverable = {
         "title": f"Literature Baseline Matrix, 500-Word Memory Cards & Scheme Reproduction ({len(metrics_rows)} Schemes)",
         "kind": "reproduced_experiment",
         "markdown_report": (
@@ -596,6 +749,12 @@ async def _execute_stage2_baseline_reproduction(
         "agent_trace": agent_trace,
         "checkpoint_stage": "checkpoint_1_literature_outline",
     }
+    stage2_deliverable["critic_check"] = _run_stage_critic_check(
+        stage_category="baseline_reproduction",
+        deliverable=stage2_deliverable,
+        sources_count=len(sources),
+    )
+    ticket.deliverable_json = stage2_deliverable
     ticket.execution_log_json = [
         *(ticket.execution_log_json or []),
         *agent_trace,
@@ -1437,12 +1596,24 @@ async def _generate_stage5_manuscript_markdown(
                 model=model,
                 api_base=api_base,
                 api_key=api_key,
-                max_tokens=3600,
+                max_tokens=4800,
             )
             cleaned_generated = _sanitize_stage_text(generated)
+            if cleaned_generated.count("$$") % 2 == 1:
+                cleaned_generated = (
+                    re.sub(r"(\\[a-zA-Z]+[_^]?\{[^}]*|[_^]\{[^}]*|\\[a-zA-Z]*)$", "", cleaned_generated.rstrip())
+                    .rstrip(",;\\ ")
+                )
+                cleaned_generated = f"{cleaned_generated}\n$$"
             if len(cleaned_generated) >= 400:
-                if "## 6. References" not in cleaned_generated and "## References" not in cleaned_generated:
-                    cleaned_generated = f"{cleaned_generated}\n\n## 6. References\n{citations_md}"
+                if (
+                    "## 6. References" not in cleaned_generated
+                    and "## References" not in cleaned_generated
+                    and "## 6. 参考文献" not in cleaned_generated
+                ):
+                    has_cjk = any("\u4e00" <= ch <= "\u9fff" for ch in cleaned_generated)
+                    ref_heading = "## 6. 参考文献" if has_cjk else "## 6. References"
+                    cleaned_generated = f"{cleaned_generated}\n\n{ref_heading}\n{citations_md}"
                 return cleaned_generated
         except Exception as exc:
             logger.warning("Stage 5 LLM manuscript generation failed, using structured fallback: %s", exc)
@@ -1588,10 +1759,10 @@ async def _execute_stage5_manuscript_assembly(
     agent_trace = list(full_state.get("agent_trace") or [])
 
     citations_list = [
-        f"[{c.get('source_id', f'Doc_{i}_Page_1')}] {c.get('title')} (DOI: {c.get('doi') or 'N/A'})"
+        f"- **[{c.get('source_id', f'Doc_{i}_Page_1')}]** {c.get('title')} (DOI: {c.get('doi') or 'N/A'})"
         for i, c in enumerate(memory_cards[:8], start=1)
     ]
-    citations_md = "\n".join(citations_list) if citations_list else "[Doc_1_Page_1] Project Reference Corpus"
+    citations_md = "\n".join(citations_list) if citations_list else "- **[Doc_1_Page_1]** Project Reference Corpus"
     primary_sid = memory_cards[0].get("source_id", "Doc_1_Page_1") if memory_cards else "Doc_1_Page_1"
 
     manuscript_md = await _generate_stage5_manuscript_markdown(
@@ -1664,6 +1835,19 @@ async def _execute_stage5_manuscript_assembly(
     }
 
     peer_review = await _run_stage5_peer_review(db, ticket=ticket, manuscript_md=manuscript_md)
+    await _register_manuscript_pdf_in_materials(
+        db,
+        ticket=ticket,
+        title=manuscript_object["title"],
+        markdown_body=manuscript_md,
+        figures=stage5_figures,
+        chart_svg=(
+            data_cross_val.get("chart_svg")
+            if isinstance(data_cross_val, dict)
+            else None
+        ),
+        owner_id=ticket.assignee_id or ticket.created_by,
+    )
 
     ticket.attention_json = None
     ticket.report_state = "ready"
@@ -1672,7 +1856,7 @@ async def _execute_stage5_manuscript_assembly(
         f"{len(memory_cards)} 500-word memory card(s), and {len(iterations)} experimental iteration(s). "
         f"Passed strict [Source_ID] provenance guard and generated DOI BibTeX."
     )
-    ticket.deliverable_json = {
+    stage5_deliverable = {
         "title": f"Evidence-Grounded Manuscript Draft, Provenance Audit & BibTeX ({q_title})",
         "kind": "manuscript_section",
         "markdown_report": manuscript_md,
@@ -1689,6 +1873,12 @@ async def _execute_stage5_manuscript_assembly(
         "checkpoint_stage": "completed",
         "peer_review": peer_review,
     }
+    stage5_deliverable["critic_check"] = _run_stage_critic_check(
+        stage_category="manuscript_writing",
+        deliverable=stage5_deliverable,
+        sources_count=len(sources),
+    )
+    ticket.deliverable_json = stage5_deliverable
     ticket.execution_log_json = [
         *(ticket.execution_log_json or []),
         *agent_trace,
@@ -1788,6 +1978,35 @@ async def create_and_run_ticket(
         }
 
     await db.flush()
+    await log_activity(
+        db,
+        project_id=project_id,
+        actor_id=ticket.created_by,
+        action="ticket_created",
+        target_type="research_ticket",
+        target_id=ticket.id,
+        target_title=f"{ticket.short_key}: {ticket.title}",
+    )
+    if ticket.stage == "person / answer":
+        await log_activity(
+            db,
+            project_id=project_id,
+            actor_id=None,
+            action="attention_requested",
+            target_type="research_ticket",
+            target_id=ticket.id,
+            target_title=f"{ticket.short_key}: {ticket.title}",
+        )
+    elif ticket.report_state == "ready":
+        await log_activity(
+            db,
+            project_id=project_id,
+            actor_id=None,
+            action="deliverable_ready",
+            target_type="research_ticket",
+            target_id=ticket.id,
+            target_title=f"{ticket.short_key}: {ticket.title}",
+        )
     return ticket
 
 
@@ -2112,6 +2331,8 @@ async def define_project_research_question(
         target_title=research_object.title,
     )
 
+    await sync_stage_milestones(db, project_id=project_id, actor_id=user.id, only_if_empty=True)
+
     ticket: ResearchTicket | None = None
     if body.trigger_baseline:
         _, ticket = await emit_project_trigger(
@@ -2353,6 +2574,18 @@ async def _advance_deep_research_to_writer(
         )
 
     peer_review = await _run_stage5_peer_review(db, ticket=ticket, manuscript_md=manuscript_md)
+    await _register_manuscript_pdf_in_materials(
+        db,
+        ticket=ticket,
+        title=proposed_objects[0]["title"],
+        markdown_body=manuscript_md,
+        chart_svg=(
+            data_cross_val.get("chart_svg")
+            if isinstance(data_cross_val, dict)
+            else None
+        ),
+        owner_id=actor_id,
+    )
 
     ticket.stage_category = "manuscript_writing"
     ticket.attention_json = None
@@ -2642,6 +2875,25 @@ async def answer_ticket_attention(
         }
     )
     ticket.thread_messages_json = messages
+    await log_activity(
+        db,
+        project_id=ticket.project_id,
+        actor_id=user.id,
+        action="attention_answered",
+        target_type="research_ticket",
+        target_id=ticket.id,
+        target_title=f"{ticket.short_key}: {ticket.title}",
+    )
+    if ticket.report_state == "ready":
+        await log_activity(
+            db,
+            project_id=ticket.project_id,
+            actor_id=None,
+            action="deliverable_ready",
+            target_type="research_ticket",
+            target_id=ticket.id,
+            target_title=f"{ticket.short_key}: {ticket.title}",
+        )
     await db.flush()
     return ticket
 
@@ -2710,6 +2962,15 @@ async def upload_ticket_wetlab_results(
         }
     )
     ticket.thread_messages_json = messages
+    await log_activity(
+        db,
+        project_id=ticket.project_id,
+        actor_id=user.id,
+        action="wetlab_uploaded",
+        target_type="research_ticket",
+        target_id=ticket.id,
+        target_title=f"{ticket.short_key}: {ticket.title}",
+    )
     await db.flush()
     return ticket
 
@@ -2931,6 +3192,15 @@ async def spawn_next_experiment_round(
         ticket_id=new_ticket.id,
     )
     db.add(trigger)
+    await log_activity(
+        db,
+        project_id=parent_ticket.project_id,
+        actor_id=user.id,
+        action="next_round_spawned",
+        target_type="research_ticket",
+        target_id=new_ticket.id,
+        target_title=f"{new_ticket.short_key}: {new_ticket.title}",
+    )
     await db.flush()
     return new_ticket
 
@@ -3066,6 +3336,7 @@ async def append_ticket_thread_message(
             body=TicketAnswerRequest(answer=body.content.strip()),
         )
 
+    user_text = body.content.strip()
     messages = list(ticket.thread_messages_json or [])
     messages.append(
         {
@@ -3073,19 +3344,20 @@ async def append_ticket_thread_message(
             "author_id": user.id,
             "author_name": user.display_name or user.username,
             "role": "human",
-            "content": body.content.strip(),
+            "content": user_text,
             "trigger_kind": "thread_message",
             "created_at": _now_iso(),
         }
     )
     ticket.thread_messages_json = messages
 
+    reply_text: str | None = None
     if body.invoke_agent:
         reply_text = await _generate_superagent_thread_reply(
             db,
             ticket=ticket,
             user=user,
-            user_message=body.content.strip(),
+            user_message=user_text,
         )
         messages = list(ticket.thread_messages_json or [])
         messages.append(
@@ -3100,6 +3372,20 @@ async def append_ticket_thread_message(
             }
         )
         ticket.thread_messages_json = messages
+
+    # Sync ticket discussion into its linked project Session so it appears in the Sessions tab
+    if getattr(user, "workspace", None) is not None:
+        from app.models.message import Message
+
+        linked_session = await open_or_get_ticket_session(
+            db,
+            project_id=ticket.project_id,
+            ticket=ticket,
+            user=user,
+        )
+        db.add(Message(session_id=linked_session.id, role="user", content=user_text))
+        if reply_text:
+            db.add(Message(session_id=linked_session.id, role="assistant", content=reply_text))
 
     await db.flush()
     return ticket
@@ -3304,3 +3590,383 @@ async def get_superagent_overview(
             for tr in triggers[:15]
         ],
     )
+
+
+STAGE_MILESTONE_TITLES: tuple[tuple[str, str], ...] = (
+    ("problem_framing", "Stage 1: Problem Framing & Research Question"),
+    ("baseline_reproduction", "Stage 2: Literature & Baseline Reproduction"),
+    ("innovation_feasibility", "Stage 3: Innovation & Feasibility"),
+    ("experiment_iteration", "Stage 4: Verification & Iteration"),
+    ("manuscript_writing", "Stage 5: Paper Writing & Peer Review"),
+)
+
+
+async def sync_stage_milestones(
+    db: AsyncSession,
+    *,
+    project_id: str,
+    actor_id: str | None,
+    only_if_empty: bool = False,
+) -> list[dict[str, Any]]:
+    """Ensure 5 stage milestone plans exist and align their status with pipeline progress."""
+    from app.models.project_plan import ProjectPlan
+
+    existing_plans = (
+        await db.execute(
+            select(ProjectPlan).where(
+                ProjectPlan.project_id == project_id,
+                ProjectPlan.stage_category.is_not(None),
+            )
+        )
+    ).scalars().all()
+    if only_if_empty and existing_plans:
+        return []
+
+    overview = await get_superagent_overview(db, project_id=project_id)
+    stage_status_map = {
+        s.stage_category: s.status for s in overview.pipeline_stages
+    }
+    by_stage = {p.stage_category: p for p in existing_plans if p.stage_category}
+
+    created_or_updated: list[dict[str, Any]] = []
+    for stage_cat, default_title in STAGE_MILESTONE_TITLES:
+        st = stage_status_map.get(stage_cat, "empty")
+        derived_status = (
+            "done"
+            if st == "completed"
+            else ("in_progress" if st in ("active", "needs_person") else "todo")
+        )
+        plan = by_stage.get(stage_cat)
+        if plan is None:
+            plan = ProjectPlan(
+                project_id=project_id,
+                title=default_title,
+                content=f"Auto-linked milestone for {stage_cat}",
+                priority="medium",
+                tags=["milestone", stage_cat],
+                stage_category=stage_cat,
+                status=derived_status,
+                created_by=actor_id,
+            )
+            db.add(plan)
+            await db.flush()
+        elif plan.status != derived_status:
+            plan.status = derived_status
+        created_or_updated.append(
+            {
+                "id": plan.id,
+                "stage_category": plan.stage_category,
+                "title": plan.title,
+                "status": plan.status,
+            }
+        )
+    await db.flush()
+    return created_or_updated
+
+
+async def get_project_todos(
+    db: AsyncSession,
+    *,
+    project_id: str,
+) -> dict[str, Any]:
+    """Aggregate actionable human todos from superagent tickets and manual project plans."""
+    from app.models.project_plan import ProjectPlan
+
+    tickets = (
+        await db.execute(
+            select(ResearchTicket)
+            .where(
+                ResearchTicket.project_id == project_id,
+                ResearchTicket.status == "open",
+            )
+            .order_by(ResearchTicket.updated_at.desc())
+        )
+    ).scalars().all()
+
+    ticket_todos: list[dict[str, Any]] = []
+    for t in tickets:
+        if t.stage == "person / answer":
+            ticket_todos.append(
+                {
+                    "kind": "attention",
+                    "ticket_id": t.id,
+                    "short_key": t.short_key,
+                    "title": t.title,
+                    "stage_category": t.stage_category,
+                    "prompt": (t.attention_json or {}).get("question") or t.summary,
+                    "options": (t.attention_json or {}).get("options") or [],
+                    "updated_at": t.updated_at.isoformat() if t.updated_at else None,
+                }
+            )
+        elif t.report_state == "ready":
+            ticket_todos.append(
+                {
+                    "kind": "approve",
+                    "ticket_id": t.id,
+                    "short_key": t.short_key,
+                    "title": t.title,
+                    "stage_category": t.stage_category,
+                    "prompt": t.summary,
+                    "options": [],
+                    "updated_at": t.updated_at.isoformat() if t.updated_at else None,
+                }
+            )
+
+    plans = (
+        await db.execute(
+            select(ProjectPlan)
+            .options(selectinload(ProjectPlan.assignee))
+            .where(
+                ProjectPlan.project_id == project_id,
+                ProjectPlan.status != "done",
+            )
+            .order_by(ProjectPlan.due_date.asc().nulls_last(), ProjectPlan.created_at.desc())
+        )
+    ).scalars().all()
+
+    plan_todos = [
+        {
+            "id": p.id,
+            "title": p.title,
+            "status": p.status,
+            "priority": p.priority,
+            "stage_category": p.stage_category,
+            "ticket_id": p.ticket_id,
+            "due_date": p.due_date.isoformat() if p.due_date else None,
+            "assignee_id": p.assignee_id,
+            "assignee_name": (
+                (p.assignee.display_name or p.assignee.username)
+                if p.assignee
+                else None
+            ),
+        }
+        for p in plans
+    ]
+
+    return {
+        "total_count": len(ticket_todos) + len(plan_todos),
+        "ticket_todo_count": len(ticket_todos),
+        "plan_todo_count": len(plan_todos),
+        "ticket_todos": ticket_todos,
+        "plan_todos": plan_todos,
+    }
+
+
+async def open_or_get_ticket_session(
+    db: AsyncSession,
+    *,
+    project_id: str,
+    ticket: ResearchTicket,
+    user: User,
+) -> Session:
+    """Find or create a project Session linked to this ResearchTicket with seeded context."""
+    from app.models.message import Message
+    from app.models.source import SessionSource
+    from app.services.research_context import collect_project_source_ids
+
+    existing = (
+        await db.execute(
+            select(Session)
+            .where(
+                Session.project_id == project_id,
+                Session.ticket_id == ticket.id,
+            )
+            .order_by(Session.created_at.desc())
+            .limit(1)
+        )
+    ).scalar_one_or_none()
+    if existing is not None:
+        return existing
+
+    session = Session(
+        workspace_id=user.workspace.id,
+        project_id=project_id,
+        ticket_id=ticket.id,
+        stage_category=ticket.stage_category,
+        title=f"[{ticket.short_key}] {ticket.title[:120]}",
+    )
+    db.add(session)
+    await db.flush()
+
+    source_ids = await collect_project_source_ids(db=db, project_id=project_id, user=user)
+    for sid in source_ids:
+        db.add(SessionSource(session_id=session.id, source_id=sid))
+
+    context_parts = [
+        f"Linked Research Ticket: **{ticket.short_key}** — {ticket.title}",
+        f"Stage: `{ticket.stage_category}` (status: `{ticket.stage}`)",
+    ]
+    if ticket.summary:
+        context_parts.append(f"Summary: {ticket.summary}")
+    if ticket.attention_json and isinstance(ticket.attention_json, dict):
+        q = ticket.attention_json.get("question")
+        if q:
+            context_parts.append(f"Pending Human Decision: {q}")
+    if ticket.deliverable_json and isinstance(ticket.deliverable_json, dict):
+        md = str(ticket.deliverable_json.get("markdown_report") or "")
+        if md:
+            context_parts.append(f"Deliverable Excerpt:\n{md[:1200]}")
+
+    db.add(
+        Message(
+            session_id=session.id,
+            role="assistant",
+            content="\n\n".join(context_parts),
+        )
+    )
+    await log_activity(
+        db,
+        project_id=project_id,
+        actor_id=user.id,
+        action="session_created",
+        target_type="session",
+        target_id=session.id,
+        target_title=session.title,
+    )
+    await db.flush()
+    return session
+
+
+async def precipitate_session_to_ticket(
+    db: AsyncSession,
+    *,
+    project_id: str,
+    ticket: ResearchTicket,
+    session: Session,
+    user: User,
+    summary: str | None = None,
+    create_research_object: bool = True,
+) -> tuple[ResearchTicket, ResearchObject | None]:
+    """Precipitate a session discussion conclusion back into a ticket thread and optional ResearchObject."""
+    from app.models.message import Message
+
+    conclusion = (summary or "").strip()
+    if not conclusion:
+        latest_msg = (
+            await db.execute(
+                select(Message)
+                .where(Message.session_id == session.id, Message.role == "assistant")
+                .order_by(Message.created_at.desc())
+                .limit(1)
+            )
+        ).scalar_one_or_none()
+        if latest_msg and latest_msg.content:
+            conclusion = latest_msg.content.strip()
+    if not conclusion:
+        raise ValueError("No conclusion text or assistant message found in session")
+
+    messages = list(ticket.thread_messages_json or [])
+    messages.append(
+        {
+            "id": str(uuid.uuid4()),
+            "author_id": user.id,
+            "author_name": user.display_name or user.username,
+            "role": "human",
+            "content": f"[Session Conclusion · {session.title or session.id[:8]}]\n\n{conclusion[:2000]}",
+            "trigger_kind": "session_precipitation",
+            "created_at": _now_iso(),
+        }
+    )
+    ticket.thread_messages_json = messages
+
+    created_obj: ResearchObject | None = None
+    if create_research_object:
+        created_obj = ResearchObject(
+            type="discussion",
+            title=f"[{ticket.short_key} Session Note] {session.title or ticket.title}"[:200],
+            content=conclusion[:6000],
+            content_json={
+                "project_id": project_id,
+                "ticket_id": ticket.id,
+                "ticket_short_key": ticket.short_key,
+                "stage": ticket.stage_category,
+                "origin_session_id": session.id,
+            },
+            created_by=user.id,
+        )
+        db.add(created_obj)
+        await db.flush()
+        await materialize_research_object_asset(
+            db=db,
+            research_object=created_obj,
+            owner_id=user.id,
+            origin_project_id=project_id,
+            origin_session_id=session.id,
+            visibility_scope="project",
+            link_type="memory",
+        )
+
+    await log_activity(
+        db,
+        project_id=project_id,
+        actor_id=user.id,
+        action="session_precipitated",
+        target_type="research_ticket",
+        target_id=ticket.id,
+        target_title=f"{ticket.short_key}: {session.title or ticket.title}",
+    )
+    await db.flush()
+    return ticket, created_obj
+
+
+async def spawn_rebuttal_validation_ticket(
+    db: AsyncSession,
+    *,
+    parent_ticket: ResearchTicket,
+    user: User,
+    focus_comment: str | None = None,
+) -> ResearchTicket:
+    """Turn Stage 5 peer-review weaknesses into a bounded Stage 4 rebuttal validation ticket (1 round)."""
+    deliv = parent_ticket.deliverable_json or {}
+    peer_review = deliv.get("peer_review") or {}
+    weaknesses = [str(w).strip() for w in (peer_review.get("Weaknesses") or []) if str(w).strip()]
+    questions = [str(q).strip() for q in (peer_review.get("Questions") or []) if str(q).strip()]
+
+    focus_parts: list[str] = []
+    if focus_comment and focus_comment.strip():
+        focus_parts.append(focus_comment.strip())
+    if weaknesses:
+        focus_parts.append("Reviewer weaknesses: " + "; ".join(weaknesses[:3]))
+    if questions:
+        focus_parts.append("Reviewer questions: " + "; ".join(questions[:2]))
+
+    direction_note = (
+        " | ".join(focus_parts)
+        if focus_parts
+        else f"Address peer review feedback from {parent_ticket.short_key} with targeted empirical verification."
+    )
+
+    policy = await get_or_create_project_policy(db, parent_ticket.project_id)
+    next_round = (parent_ticket.iteration_round or 1) + 1
+    new_ticket = await create_and_run_ticket(
+        db,
+        project_id=parent_ticket.project_id,
+        user=user,
+        title=f"Rebuttal Validation ({parent_ticket.short_key}): {direction_note[:72]}",
+        stage_category="experiment_iteration",
+        mandate={
+            "strength": "explicit",
+            "rule_id": "stage4_rebuttal_validation",
+            "policy_version": policy.version,
+            "scope": direction_note,
+            "parent_ticket_key": parent_ticket.short_key,
+            "rebuttal_round": 1,
+        },
+        iteration_round=next_round,
+        parent_ticket_id=parent_ticket.id,
+        plugin_id=parent_ticket.plugin_id,
+        assignee_id=parent_ticket.assignee_id or user.id,
+        initial_message=direction_note,
+    )
+
+    await log_activity(
+        db,
+        project_id=parent_ticket.project_id,
+        actor_id=user.id,
+        action="rebuttal_validation_spawned",
+        target_type="research_ticket",
+        target_id=new_ticket.id,
+        target_title=f"{new_ticket.short_key}: {new_ticket.title}",
+    )
+    await db.flush()
+    return new_ticket

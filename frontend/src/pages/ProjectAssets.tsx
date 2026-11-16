@@ -353,7 +353,9 @@ export default function ProjectAssets({ embedded = false }: { embedded?: boolean
   const normalizedSearch = searchText.trim().toLowerCase();
   // In embedded mode collections are shown in their own section below.
   const visibleAssets = assets.filter((asset) => {
-    if (embedded && asset.source_type === 'group') return false;
+    if (embedded && (asset.source_type === 'group' || asset.asset_type === 'research_memory')) {
+      return false;
+    }
     if (!normalizedSearch) return true;
     const haystack = `${asset.title} ${asset.description || ''}`.toLowerCase();
     return haystack.includes(normalizedSearch);

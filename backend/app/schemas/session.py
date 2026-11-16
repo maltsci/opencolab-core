@@ -6,6 +6,8 @@ from pydantic import BaseModel, Field
 class SessionCreate(BaseModel):
     title: str | None = None
     project_id: str | None = None
+    ticket_id: str | None = None
+    stage_category: str | None = Field(default=None, max_length=40)
     task_id: str | None = Field(default=None, max_length=100)
     tag_ids: list[str] | None = None
 
@@ -19,6 +21,8 @@ class SessionResponse(BaseModel):
     id: str
     workspace_id: str
     project_id: str | None = None
+    ticket_id: str | None = None
+    stage_category: str | None = None
     title: str | None
     task_id: str | None = None
     conversation_summary: str | None = None

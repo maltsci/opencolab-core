@@ -28,6 +28,8 @@ export interface UserOption {
 export interface ProjectSession {
   id: string;
   project_id: string | null;
+  ticket_id?: string | null;
+  stage_category?: string | null;
   task_id?: string | null;
   title: string | null;
   created_at: string;
@@ -48,6 +50,8 @@ export interface ProjectPlan {
   due_date: string | null;
   priority: PlanPriority;
   tags: string[];
+  stage_category?: string | null;
+  ticket_id?: string | null;
   assignee_id: string | null;
   assignee_name: string | null;
   status: PlanStatus;
@@ -55,6 +59,37 @@ export interface ProjectPlan {
   creator_name: string | null;
   created_at: string;
   updated_at: string;
+}
+
+export interface ProjectTicketTodoItem {
+  kind: 'attention' | 'approve';
+  ticket_id: string;
+  short_key: string;
+  title: string;
+  stage_category: string;
+  prompt?: string | null;
+  options?: string[];
+  updated_at?: string | null;
+}
+
+export interface ProjectPlanTodoItem {
+  id: string;
+  title: string;
+  status: PlanStatus;
+  priority: PlanPriority;
+  stage_category?: string | null;
+  ticket_id?: string | null;
+  due_date?: string | null;
+  assignee_id?: string | null;
+  assignee_name?: string | null;
+}
+
+export interface ProjectTodosResponse {
+  total_count: number;
+  ticket_todo_count: number;
+  plan_todo_count: number;
+  ticket_todos: ProjectTicketTodoItem[];
+  plan_todos: ProjectPlanTodoItem[];
 }
 
 export interface ProjectActivity {

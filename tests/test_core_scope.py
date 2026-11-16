@@ -31,7 +31,8 @@ def test_core_migrations_keep_notifications_and_training_without_domain_tables()
     config.set_main_option("script_location", str(root / "backend/alembic"))
     scripts = ScriptDirectory.from_config(config)
     revisions = list(scripts.walk_revisions())
-    assert scripts.get_heads() == ["u5v6w7x8y9z0"]
+    assert scripts.get_heads() == ["v6w7x8y9z0a1"]
+    assert scripts.get_revision("v6w7x8y9z0a1").down_revision == "u5v6w7x8y9z0"
     assert scripts.get_revision("u5v6w7x8y9z0").down_revision == "t4u5v6w7x8y9"
     assert scripts.get_revision("t4u5v6w7x8y9").down_revision == "r2s3t4u5v6w7"
     assert scripts.get_revision("n2c3d4e5f6a7").down_revision == "j8e9f0a1b2c3"

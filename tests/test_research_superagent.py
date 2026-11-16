@@ -301,6 +301,17 @@ async def test_five_stage_research_superagent_lifecycle(
     }
     assert final_data["flow_24h"]["completed"] >= 4
 
+    # Generated Stage 5 manuscript PDF should appear in Project Materials (/assets)
+    assets_resp = await client.get(
+        f"/api/v1/projects/{project_id}/assets",
+        headers=researcher_headers,
+    )
+    assert assets_resp.status_code == 200
+    assert any(
+        (item.get("title") or "").endswith(".pdf")
+        for item in assets_resp.json()
+    )
+
 
 async def test_policy_observe_mode_and_shared_thread_messages(
     client: AsyncClient,

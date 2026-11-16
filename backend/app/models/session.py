@@ -19,6 +19,15 @@ class Session(Base):
     project_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("projects.id", ondelete="SET NULL"), index=True
     )
+    ticket_id: Mapped[str | None] = mapped_column(
+        String(36),
+        ForeignKey("research_tickets.id", ondelete="SET NULL"),
+        nullable=True,
+        index=True,
+    )
+    stage_category: Mapped[str | None] = mapped_column(
+        String(40), nullable=True, index=True
+    )
     title: Mapped[str | None] = mapped_column(String(500))
     task_id: Mapped[str | None] = mapped_column(String(100), index=True)
     conversation_summary: Mapped[str | None] = mapped_column(Text)

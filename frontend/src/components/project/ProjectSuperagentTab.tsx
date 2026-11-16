@@ -38,8 +38,9 @@ import {
   message,
   theme,
 } from 'antd';
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useState, type ReactNode } from 'react';
 import { useTranslation } from 'react-i18next';
+import { useNavigate } from 'react-router-dom';
 
 import apiClient from '../../services/api-client';
 import { MarkdownContent } from '../ui/ChatMessage';
@@ -60,6 +61,11 @@ const { Text, Paragraph } = Typography;
 interface ProjectSuperagentTabProps {
   project: Project;
   canManage: boolean;
+  initialTicketId?: string | null;
+  initialStage?: string | null;
+  onClearDeepLink?: () => void;
+  onWorkspaceChanged?: () => void;
+  activityTimeline?: ReactNode;
 }
 
 const STAGE_ORDER: StageCategory[] = [
@@ -81,12 +87,29 @@ const STAGE_BADGE_COLORS: Record<string, string> = {
   ended: 'success',
 };
 
+const STAGE_LABEL_KEYS: Record<string, string> = {
+  'person / answer': 'superagent.ticketStage.personAnswer',
+  'person / wetlab': 'superagent.ticketStage.personWetlab',
+  'person / review': 'superagent.ticketStage.personReview',
+  'person / blocked': 'superagent.ticketStage.personBlocked',
+  'working / queued': 'superagent.ticketStage.workingQueued',
+  working: 'superagent.ticketStage.working',
+  idle: 'superagent.ticketStage.idle',
+  ended: 'superagent.ticketStage.ended',
+};
+
 export default function ProjectSuperagentTab({
   project,
   canManage,
+  initialTicketId,
+  initialStage,
+  onClearDeepLink,
+  onWorkspaceChanged,
+  activityTimeline,
 }: ProjectSuperagentTabProps) {
   const { t } = useTranslation();
   const { token } = theme.useToken();
+  const navigate = useNavigate();
 
   const [overview, setOverview] = useState<SuperagentOverview | null>(null);
   const [tickets, setTickets] = useState<ResearchTicket[]>([]);
@@ -131,16 +154,68 @@ export default function ProjectSuperagentTab({
         if (!prev) return null;
         return tkRes.data.find((item) => item.id === prev.id) ?? prev;
       });
+      onWorkspaceChanged?.();
     } catch {
       message.error(t('superagent.loadFailed'));
     } finally {
       setLoading(false);
     }
-  }, [project.id, t]);
+  }, [onWorkspaceChanged, project.id, t]);
 
   useEffect(() => {
     fetchAll();
   }, [fetchAll]);
+
+  useEffect(() => {
+    if (initialStage && STAGE_ORDER.includes(initialStage as StageCategory)) {
+      setSelectedStage(initialStage as StageCategory);
+      onClearDeepLink?.();
+    }
+  }, [initialStage, onClearDeepLink]);
+
+  useEffect(() => {
+    if (!initialTicketId || tickets.length === 0) return;
+    const found = tickets.find((item) => item.id === initialTicketId);
+    if (found) {
+      setActiveTicket(found);
+      setSelectedStage(found.stage_category);
+      onClearDeepLink?.();
+    }
+  }, [initialTicketId, onClearDeepLink, tickets]);
+
+  const handleDiscussInSession = async (ticket: ResearchTicket) => {
+    setSubmittingId(`open-session-${ticket.id}`);
+    try {
+      const res = await apiClient.post<{
+        session_id: string;
+        title: string;
+      }>(`/projects/${project.id}/tickets/${ticket.id}/open-session`);
+      onWorkspaceChanged?.();
+      navigate(`/sessions/${res.data.session_id}`);
+    } catch {
+      message.error(t('superagent.actionFailed'));
+    } finally {
+      setSubmittingId(null);
+    }
+  };
+
+  const handleSpawnRebuttal = async (ticketId: string) => {
+    setSubmittingId(`rebuttal-${ticketId}`);
+    try {
+      const res = await apiClient.post<ResearchTicket>(
+        `/projects/${project.id}/tickets/${ticketId}/rebuttal-validation`,
+        {},
+      );
+      message.success(t('superagent.rebuttalSpawned'));
+      await fetchAll();
+      setSelectedStage('experiment_iteration');
+      setActiveTicket(res.data);
+    } catch {
+      message.error(t('superagent.actionFailed'));
+    } finally {
+      setSubmittingId(null);
+    }
+  };
 
   useEffect(() => {
     apiClient
@@ -696,7 +771,16 @@ export default function ProjectSuperagentTab({
     const writerOut = deliverable.writer_output;
     const ideaEval = deliverable.idea_evaluation;
     const peerReview = deliverable.peer_review;
+    const criticCheck = (deliverable as unknown as {
+      critic_check?: {
+        status: 'passed' | 'warning';
+        passed_count: number;
+        checked_count: number;
+        checks?: Array<{ key: string; passed: boolean }>;
+      };
+    }).critic_check;
     const agentTrace = deliverable.agent_trace || [];
+    const matchedTicket = tickets.find((tk) => tk.short_key === shortKey);
 
     if (
       plannerSubtasks.length === 0 &&
@@ -705,6 +789,7 @@ export default function ProjectSuperagentTab({
       !writerOut &&
       !ideaEval &&
       !peerReview &&
+      !criticCheck &&
       agentTrace.length === 0
     ) {
       return null;
@@ -1024,8 +1109,62 @@ export default function ProjectSuperagentTab({
         {/* 5. Stage 3: Idea 3D Scoring & Novelty Check */}
         {ideaEval && <IdeaEvaluationCard evaluation={ideaEval} />}
 
-        {/* 6. Stage 5: Pessimistic Peer Review Scorecard */}
-        {peerReview && <PeerReviewCard review={peerReview} />}
+        {/* 6. Critic Self-Check Summary */}
+        {criticCheck && (
+          <Card
+            size="small"
+            style={{ background: token.colorBgContainer }}
+            title={(
+              <Space size={8} wrap>
+                <Tag
+                  bordered={false}
+                  color={criticCheck.status === 'passed' ? 'success' : 'warning'}
+                >
+                  {criticCheck.status === 'passed'
+                    ? t('superagent.criticCheckPassed', {
+                        passed: criticCheck.passed_count,
+                        total: criticCheck.checked_count,
+                      })
+                    : t('superagent.criticCheckWarning', {
+                        passed: criticCheck.passed_count,
+                        total: criticCheck.checked_count,
+                      })}
+                </Tag>
+              </Space>
+            )}
+          >
+            <Space size={[6, 6]} wrap>
+              {(criticCheck.checks || []).map((c) => (
+                <Tag
+                  key={c.key}
+                  bordered={false}
+                  color={c.passed ? 'success' : 'warning'}
+                >
+                  {`${c.passed ? '✓' : '!'} ${t(`superagent.criticChecks.${c.key}`, {
+                    defaultValue: c.key,
+                  })}`}
+                </Tag>
+              ))}
+            </Space>
+          </Card>
+        )}
+
+        {/* 7. Stage 5: Pessimistic Peer Review Scorecard */}
+        {peerReview && (
+          <PeerReviewCard
+            review={peerReview}
+            onSpawnRebuttal={
+              matchedTicket
+                ? () => void handleSpawnRebuttal(matchedTicket.id)
+                : undefined
+            }
+            rebuttalLoading={
+              matchedTicket
+                ? submittingId === `rebuttal-${matchedTicket.id}`
+                : false
+            }
+          />
+        )}
       </Space>
     );
   };
@@ -1293,15 +1432,15 @@ export default function ProjectSuperagentTab({
                 size="small"
                 style={{ background: token.colorBgContainer }}
                 title={(
-                  <Space wrap>
-                    <Tag color={STAGE_BADGE_COLORS[ticket.stage] || 'default'}>
-                      {ticket.stage}
+                  <Space wrap size={6}>
+                    <Tag bordered={false} color={STAGE_BADGE_COLORS[ticket.stage] || 'default'}>
+                      {STAGE_LABEL_KEYS[ticket.stage] ? t(STAGE_LABEL_KEYS[ticket.stage]) : ticket.stage}
                     </Tag>
-                    <Text code>{ticket.short_key}</Text>
-                    <Text strong>{ticket.title}</Text>
-                    <Tag>{t(`superagent.stages.${ticket.stage_category}`)}</Tag>
+                    <Text code style={{ fontSize: 12 }}>{ticket.short_key}</Text>
+                    <Text strong style={{ fontSize: 14 }}>{ticket.title}</Text>
+                    <Tag bordered={false}>{t(`superagent.stages.${ticket.stage_category}`)}</Tag>
                     {ticket.iteration_round ? (
-                      <Tag color="purple">{`Round ${ticket.iteration_round}`}</Tag>
+                      <Tag bordered={false} color="purple">{`#${ticket.iteration_round}`}</Tag>
                     ) : null}
                   </Space>
                 )}
@@ -1862,70 +2001,111 @@ export default function ProjectSuperagentTab({
                                     )}
                                   </Space>
                                 </div>
-                                {obj.content && (
-                                  <div
-                                    style={{
-                                      marginTop: 6,
-                                      fontSize: 13,
-                                    }}
-                                  >
-                                    <MarkdownContent content={obj.content} />
-                                  </div>
-                                )}
-                                {Array.isArray(cj.figures) &&
-                                  cj.figures.map((fig: unknown, figIdx: number) => {
-                                    const f = fig as {
-                                      title?: string;
-                                      svg?: string;
-                                      caption?: string;
-                                    };
-                                    if (!f || typeof f.svg !== 'string') {
-                                      return null;
-                                    }
-                                    return (
-                                      <div
-                                        key={`fig-${figIdx}`}
-                                        style={{
-                                          marginTop: 12,
-                                          padding: 10,
-                                          borderRadius: token.borderRadius,
-                                          background: token.colorBgContainer,
-                                          border: `1px solid ${token.colorBorderSecondary}`,
-                                          overflowX: 'auto',
-                                        }}
-                                      >
-                                        {f.title && (
-                                          <Text
-                                            strong
-                                            style={{
-                                              display: 'block',
-                                              marginBottom: 6,
-                                              fontSize: 12,
-                                            }}
-                                          >
-                                            {f.title}
-                                          </Text>
-                                        )}
-                                        <div
-                                          dangerouslySetInnerHTML={{
-                                            __html: f.svg,
+                                {(() => {
+                                  const figs = Array.isArray(cj.figures)
+                                    ? (cj.figures as Array<{
+                                        title?: string;
+                                        svg?: string;
+                                        caption?: string;
+                                      }>).filter((f) => f && typeof f.svg === 'string')
+                                    : [];
+
+                                  const renderFigureCard = (
+                                    f: { title?: string; svg?: string; caption?: string },
+                                    figIdx: number,
+                                  ) => (
+                                    <div
+                                      key={`fig-${figIdx}`}
+                                      style={{
+                                        margin: '14px 0',
+                                        padding: 12,
+                                        borderRadius: token.borderRadius,
+                                        background: token.colorBgContainer,
+                                        border: `1px solid ${token.colorBorderSecondary}`,
+                                        overflowX: 'auto',
+                                      }}
+                                    >
+                                      {f.title && (
+                                        <Text
+                                          strong
+                                          style={{
+                                            display: 'block',
+                                            marginBottom: 8,
+                                            fontSize: 13,
                                           }}
-                                        />
-                                        {f.caption && (
-                                          <Text
-                                            type="secondary"
-                                            style={{
-                                              display: 'block',
-                                              marginTop: 6,
-                                              fontSize: 12,
-                                            }}
-                                          >
-                                            {f.caption}
-                                          </Text>
-                                        )}
+                                        >
+                                          {f.title}
+                                        </Text>
+                                      )}
+                                      <div
+                                        dangerouslySetInnerHTML={{
+                                          __html: f.svg || '',
+                                        }}
+                                      />
+                                      {f.caption && (
+                                        <Text
+                                          type="secondary"
+                                          style={{
+                                            display: 'block',
+                                            marginTop: 8,
+                                            fontSize: 12,
+                                          }}
+                                        >
+                                          {f.caption}
+                                        </Text>
+                                      )}
+                                    </div>
+                                  );
+
+                                  if (!obj.content) {
+                                    return figs.map((f, i) => renderFigureCard(f, i));
+                                  }
+
+                                  const sec4Match = obj.content.match(/\n(?=##\s*4\.)/);
+                                  const sec56Match = obj.content.match(
+                                    /\n(?=##\s*(?:5\.|6\.|参考文献|References))/,
+                                  );
+
+                                  if (
+                                    figs.length > 0 &&
+                                    sec4Match?.index !== undefined &&
+                                    sec56Match?.index !== undefined &&
+                                    sec56Match.index > sec4Match.index
+                                  ) {
+                                    const part1 = obj.content.slice(0, sec4Match.index);
+                                    const part2 = obj.content.slice(sec4Match.index, sec56Match.index);
+                                    const part3 = obj.content.slice(sec56Match.index);
+                                    return (
+                                      <div style={{ marginTop: 6, fontSize: 13 }}>
+                                        <MarkdownContent content={part1} />
+                                        {figs[0] && renderFigureCard(figs[0], 0)}
+                                        <MarkdownContent content={part2} />
+                                        {figs[1] && renderFigureCard(figs[1], 1)}
+                                        <MarkdownContent content={part3} />
+                                        {figs.slice(2).map((f, i) => renderFigureCard(f, i + 2))}
                                       </div>
                                     );
-                                  })}
+                                  }
+
+                                  if (figs.length > 0 && sec56Match?.index !== undefined) {
+                                    const bodyBeforeRefs = obj.content.slice(0, sec56Match.index);
+                                    const refsSection = obj.content.slice(sec56Match.index);
+                                    return (
+                                      <div style={{ marginTop: 6, fontSize: 13 }}>
+                                        <MarkdownContent content={bodyBeforeRefs} />
+                                        {figs.map((f, i) => renderFigureCard(f, i))}
+                                        <MarkdownContent content={refsSection} />
+                                      </div>
+                                    );
+                                  }
+
+                                  return (
+                                    <div style={{ marginTop: 6, fontSize: 13 }}>
+                                      <MarkdownContent content={obj.content} />
+                                      {figs.map((f, i) => renderFigureCard(f, i))}
+                                    </div>
+                                  );
+                                })()}
                                 {chartSvg && !Array.isArray(cj.figures) && (
                                   <div
                                     style={{ marginTop: 8, overflowX: 'auto' }}
@@ -1977,7 +2157,9 @@ export default function ProjectSuperagentTab({
                     key: 'stage',
                     width: 136,
                     render: (v: string) => (
-                      <Tag color={STAGE_BADGE_COLORS[v] || 'default'}>{v}</Tag>
+                      <Tag bordered={false} color={STAGE_BADGE_COLORS[v] || 'default'}>
+                        {STAGE_LABEL_KEYS[v] ? t(STAGE_LABEL_KEYS[v]) : v}
+                      </Tag>
                     ),
                   },
                   {
@@ -2302,21 +2484,37 @@ export default function ProjectSuperagentTab({
 
   return (
     <div>
-      {renderStagePipelineBar()}
-      <div id="superagent-stage-workspace">
-        {renderStageFocusBanner()}
-        {renderProjectCharterSection()}
-        {renderNeedsPersonSection()}
-        {selectedStage ? (
-          <>
-            {renderStageDetailAndTickets()}
-            {renderExecutorAndPolicyBar()}
-          </>
-        ) : (
-          <>
-            {renderExecutorAndPolicyBar()}
-            {renderStageDetailAndTickets()}
-          </>
+      <div
+        style={{
+          display: 'flex',
+          gap: 16,
+          flexWrap: 'wrap',
+          alignItems: 'flex-start',
+        }}
+      >
+        <div style={{ flex: '1 1 580px', minWidth: 0 }}>
+          {renderStagePipelineBar()}
+          <div id="superagent-stage-workspace">
+            {renderStageFocusBanner()}
+            {renderProjectCharterSection()}
+            {renderNeedsPersonSection()}
+            {selectedStage ? (
+              <>
+                {renderStageDetailAndTickets()}
+                {renderExecutorAndPolicyBar()}
+              </>
+            ) : (
+              <>
+                {renderExecutorAndPolicyBar()}
+                {renderStageDetailAndTickets()}
+              </>
+            )}
+          </div>
+        </div>
+        {activityTimeline && (
+          <div style={{ flex: '0 0 320px', width: '100%', maxWidth: 340 }}>
+            {activityTimeline}
+          </div>
         )}
       </div>
 
@@ -2640,21 +2838,40 @@ export default function ProjectSuperagentTab({
         open={!!activeTicket}
         onClose={() => setActiveTicket(null)}
         width={680}
+        extra={
+          activeTicket && (
+            <Button
+              size="small"
+              icon={<CommentOutlined />}
+              loading={submittingId === `open-session-${activeTicket.id}`}
+              onClick={() => handleDiscussInSession(activeTicket)}
+            >
+              {t('superagent.discussInSessionBtn')}
+            </Button>
+          )
+        }
       >
         {activeTicket && (
           <Space direction="vertical" style={{ width: '100%' }} size={16}>
             <Descriptions size="small" bordered column={2}>
               <Descriptions.Item label={t('superagent.colStage')}>
-                <Tag color={STAGE_BADGE_COLORS[activeTicket.stage] || 'default'}>
-                  {activeTicket.stage}
+                <Tag bordered={false} color={STAGE_BADGE_COLORS[activeTicket.stage] || 'default'}>
+                  {STAGE_LABEL_KEYS[activeTicket.stage]
+                    ? t(STAGE_LABEL_KEYS[activeTicket.stage])
+                    : activeTicket.stage}
                 </Tag>
               </Descriptions.Item>
               <Descriptions.Item label={t('superagent.colLifecycleStage')}>
                 {t(`superagent.stages.${activeTicket.stage_category}`)}
               </Descriptions.Item>
               <Descriptions.Item label={t('superagent.mandateStrength')}>
-                <Tag>
-                  {String(activeTicket.mandate?.strength || 'inferred')}
+                <Tag bordered={false}>
+                  {t(
+                    `superagent.mandateStrengthMap.${String(
+                      activeTicket.mandate?.strength || 'inferred',
+                    )}`,
+                    { defaultValue: String(activeTicket.mandate?.strength || 'inferred') },
+                  )}
                 </Tag>
               </Descriptions.Item>
               <Descriptions.Item label={t('superagent.fieldAssignee')}>
@@ -2672,7 +2889,7 @@ export default function ProjectSuperagentTab({
                   }}
                   title={(
                     <Space wrap>
-                      <Tag color="gold">Human-in-the-Loop</Tag>
+                      <Tag bordered={false} color="gold">{t('superagent.humanInTheLoop')}</Tag>
                       <Text strong style={{ fontSize: 13 }}>
                         {activeTicket.attention.question}
                       </Text>

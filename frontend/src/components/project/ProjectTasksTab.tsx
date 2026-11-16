@@ -3,8 +3,22 @@ import {
   EditOutlined,
   MessageOutlined,
   PlusOutlined,
+  PushpinOutlined,
 } from '@ant-design/icons';
-import { Button, Empty, Input, List, message, Modal, Popconfirm, Spin, Typography } from 'antd';
+import {
+  Button,
+  Empty,
+  Input,
+  List,
+  message,
+  Modal,
+  Popconfirm,
+  Select,
+  Space,
+  Spin,
+  Tag,
+  Typography,
+} from 'antd';
 import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useNavigate } from 'react-router-dom';
@@ -21,11 +35,24 @@ const { Text } = Typography;
 
 const TASK_DRAFT_STORAGE_PREFIX = 'task-draft:';
 
-interface ProjectTasksTabProps {
-  project: Project;
+interface TicketOption {
+  id: string;
+  short_key: string;
+  title: string;
+  stage_category: string;
 }
 
-export default function ProjectTasksTab({ project }: ProjectTasksTabProps) {
+interface ProjectTasksTabProps {
+  project: Project;
+  onOpenTicket?: (ticketId: string) => void;
+  onPrecipitated?: () => void;
+}
+
+export default function ProjectTasksTab({
+  project,
+  onOpenTicket,
+  onPrecipitated,
+}: ProjectTasksTabProps) {
   const { t, i18n } = useTranslation();
   const { user } = useAuth();
   const navigate = useNavigate();
@@ -36,6 +63,11 @@ export default function ProjectTasksTab({ project }: ProjectTasksTabProps) {
   const [creatingSession, setCreatingSession] = useState(false);
   const [renamingSession, setRenamingSession] = useState<ProjectSession | null>(null);
   const [renameValue, setRenameValue] = useState('');
+  const [precipitatingSession, setPrecipitatingSession] = useState<ProjectSession | null>(null);
+  const [ticketOptions, setTicketOptions] = useState<TicketOption[]>([]);
+  const [selectedTicketId, setSelectedTicketId] = useState<string | undefined>(undefined);
+  const [precipitateSummary, setPrecipitateSummary] = useState('');
+  const [precipitating, setPrecipitating] = useState(false);
 
   const fetchSessions = () => {
     setSessionsLoading(true);
@@ -124,6 +156,46 @@ export default function ProjectTasksTab({ project }: ProjectTasksTabProps) {
     }
   };
 
+  const openPrecipitateModal = async (session: ProjectSession) => {
+    setPrecipitatingSession(session);
+    setSelectedTicketId(session.ticket_id ?? undefined);
+    setPrecipitateSummary('');
+    try {
+      const res = await apiClient.get<{ tickets: TicketOption[] }>(
+        `/projects/${project.id}/superagent/overview`
+      );
+      const list = res.data.tickets ?? [];
+      setTicketOptions(list);
+      if (!session.ticket_id && list.length > 0) {
+        setSelectedTicketId(list[0].id);
+      }
+    } catch {
+      message.error(t('superagent.loadFailed'));
+    }
+  };
+
+  const submitPrecipitate = async () => {
+    if (!precipitatingSession || !selectedTicketId) return;
+    setPrecipitating(true);
+    try {
+      await apiClient.post(
+        `/projects/${project.id}/tickets/${selectedTicketId}/precipitate-session`,
+        {
+          session_id: precipitatingSession.id,
+          summary: precipitateSummary.trim() || null,
+          create_research_object: true,
+        }
+      );
+      message.success(t('superagent.precipitateSuccess'));
+      setPrecipitatingSession(null);
+      onPrecipitated?.();
+    } catch {
+      message.error(t('superagent.actionFailed'));
+    } finally {
+      setPrecipitating(false);
+    }
+  };
+
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 16 }}>
       <SectionCard
@@ -158,43 +230,79 @@ export default function ProjectTasksTab({ project }: ProjectTasksTabProps) {
                     navigate(`/sessions/${session.id}`);
                   }
                 }}
-                actions={isOwn ? [
+                actions={[
                   <Button
-                    key="rename"
+                    key="precipitate"
                     type="text"
                     size="small"
-                    icon={<EditOutlined />}
-                    aria-label={t('session.rename')}
+                    icon={<PushpinOutlined />}
                     onClick={(e) => {
                       e.stopPropagation();
-                      setRenamingSession(session);
-                      setRenameValue(session.title || '');
+                      void openPrecipitateModal(session);
                     }}
-                  />,
-                  <Popconfirm
-                    key="delete"
-                    title={t('session.deleteConfirm')}
-                    description={t('session.deleteMemoryPreserved')}
-                    onConfirm={(e) => {
-                      e?.stopPropagation();
-                      return deleteSession(session.id);
-                    }}
-                    onCancel={(e) => e?.stopPropagation()}
                   >
+                    {t('superagent.precipitateToTicketBtn')}
+                  </Button>,
+                  ...(isOwn ? [
                     <Button
+                      key="rename"
                       type="text"
                       size="small"
-                      danger
-                      icon={<DeleteOutlined />}
-                      aria-label={t('common.delete')}
-                      onClick={(e) => e.stopPropagation()}
-                    />
-                  </Popconfirm>,
-                ] : []}
+                      icon={<EditOutlined />}
+                      aria-label={t('session.rename')}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setRenamingSession(session);
+                        setRenameValue(session.title || '');
+                      }}
+                    />,
+                    <Popconfirm
+                      key="delete"
+                      title={t('session.deleteConfirm')}
+                      description={t('session.deleteMemoryPreserved')}
+                      onConfirm={(e) => {
+                        e?.stopPropagation();
+                        return deleteSession(session.id);
+                      }}
+                      onCancel={(e) => e?.stopPropagation()}
+                    >
+                      <Button
+                        type="text"
+                        size="small"
+                        danger
+                        icon={<DeleteOutlined />}
+                        aria-label={t('common.delete')}
+                        onClick={(e) => e.stopPropagation()}
+                      />
+                    </Popconfirm>,
+                  ] : []),
+                ]}
               >
                 <List.Item.Meta
                   avatar={<MessageOutlined />}
-                  title={session.title || `Session ${session.id.slice(0, 8)}`}
+                  title={(
+                    <Space size={8} wrap>
+                      <span style={{ fontSize: 14, fontWeight: 500 }}>
+                        {session.title || `Session ${session.id.slice(0, 8)}`}
+                      </span>
+                      {session.stage_category && (
+                        <Tag bordered={false}>{t(`superagent.stages.${session.stage_category}`)}</Tag>
+                      )}
+                      {session.ticket_id && onOpenTicket && (
+                        <Button
+                          type="link"
+                          size="small"
+                          style={{ padding: 0, height: 'auto', fontSize: 12 }}
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onOpenTicket(session.ticket_id!);
+                          }}
+                        >
+                          {t('superagent.viewTicketBtn')}
+                        </Button>
+                      )}
+                    </Space>
+                  )}
                   description={[
                     t('session.messageCount', { count: session.message_count }),
                     !isOwn && session.owner_name
@@ -256,6 +364,38 @@ export default function ProjectTasksTab({ project }: ProjectTasksTabProps) {
           onPressEnter={renameSession}
           maxLength={500}
         />
+      </Modal>
+
+      <Modal
+        title={t('superagent.precipitateModalTitle')}
+        open={!!precipitatingSession}
+        onCancel={() => setPrecipitatingSession(null)}
+        onOk={submitPrecipitate}
+        confirmLoading={precipitating}
+        okButtonProps={{ disabled: !selectedTicketId }}
+      >
+        <Space direction="vertical" style={{ width: '100%' }} size={12}>
+          <div>
+            <Text strong style={{ display: 'block', marginBottom: 6 }}>
+              {t('superagent.precipitateSelectTicket')}
+            </Text>
+            <Select
+              style={{ width: '100%' }}
+              value={selectedTicketId}
+              onChange={(val) => setSelectedTicketId(val)}
+              options={ticketOptions.map((tk) => ({
+                value: tk.id,
+                label: `${tk.short_key} — ${tk.title}`,
+              }))}
+            />
+          </div>
+          <Input.TextArea
+            rows={4}
+            value={precipitateSummary}
+            onChange={(e) => setPrecipitateSummary(e.target.value)}
+            placeholder={t('superagent.precipitateSummaryPlaceholder')}
+          />
+        </Space>
       </Modal>
     </div>
   );

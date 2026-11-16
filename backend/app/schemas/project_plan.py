@@ -13,6 +13,8 @@ class PlanCreate(BaseModel):
     due_date: date | None = None
     priority: str = "medium"
     tags: list[str] = []
+    stage_category: str | None = None
+    ticket_id: str | None = None
     assignee_id: str | None = None
 
 
@@ -23,6 +25,8 @@ class PlanUpdate(BaseModel):
     due_date: date | None = None
     priority: str | None = None
     tags: list[str] | None = None
+    stage_category: str | None = None
+    ticket_id: str | None = None
     assignee_id: str | None = None
     status: str | None = None
 
@@ -36,6 +40,8 @@ class PlanResponse(BaseModel):
     due_date: date | None
     priority: str
     tags: list[str]
+    stage_category: str | None = None
+    ticket_id: str | None = None
     assignee_id: str | None
     assignee_name: str | None = None
     status: str

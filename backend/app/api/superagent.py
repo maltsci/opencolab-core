@@ -6,12 +6,16 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
+from pydantic import BaseModel
+
 from app.api.projects import _get_project_for_user
 from app.core.database import get_db
 from app.core.dependencies import get_current_user
 from app.models.research_object import ResearchObject
 from app.models.research_ticket import ResearchTicket
+from app.models.session import Session
 from app.models.user import User
+from app.services.activity_service import log_activity
 from app.services.manuscript_export_service import (
     render_manuscript_docx,
     render_manuscript_pdf,
@@ -46,10 +50,15 @@ from app.services.superagent_service import (
     define_project_research_question,
     emit_project_trigger,
     get_or_create_project_policy,
+    get_project_todos,
     get_superagent_overview,
     launch_academic_deep_research,
+    open_or_get_ticket_session,
+    precipitate_session_to_ticket,
     spawn_next_experiment_round,
+    spawn_rebuttal_validation_ticket,
     suggest_project_research_charter,
+    sync_stage_milestones,
     update_project_policy,
     upload_ticket_wetlab_results,
 )
@@ -602,6 +611,16 @@ async def export_ticket_manuscript(
     figures = _extract_figures_from_content_json(first_cjson)
     if not figures:
         figures = _extract_figures_from_content_json(deliverable.get("data_cross_validation"))
+    await log_activity(
+        db,
+        project_id=project_id,
+        actor_id=user.id,
+        action="manuscript_exported",
+        target_type="research_ticket",
+        target_id=ticket.id,
+        target_title=f"{ticket.short_key} ({format.upper()})",
+    )
+    await db.commit()
     return _build_manuscript_export_response(
         title=str(deliverable.get("title") or ticket.title or "Manuscript Draft"),
         markdown_text=markdown_text,
@@ -609,3 +628,122 @@ async def export_ticket_manuscript(
         export_format=format,
         fallback_stem=f"{ticket.short_key}_manuscript",
     )
+
+
+class PrecipitateSessionRequest(BaseModel):
+    session_id: str
+    summary: str | None = None
+    create_research_object: bool = True
+
+
+@router.get("/projects/{project_id}/superagent/todos")
+async def get_project_superagent_todos(
+    project_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    await _get_project_for_user(project_id, user.id, db)
+    return await get_project_todos(db, project_id=project_id)
+
+
+@router.post("/projects/{project_id}/superagent/plans/sync-milestones")
+async def post_sync_stage_milestones(
+    project_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    await _get_project_for_user(project_id, user.id, db)
+    milestones = await sync_stage_milestones(
+        db,
+        project_id=project_id,
+        actor_id=user.id,
+        only_if_empty=False,
+    )
+    await db.commit()
+    return {"milestones": milestones}
+
+
+@router.post("/projects/{project_id}/tickets/{ticket_id}/open-session")
+async def post_ticket_open_session(
+    project_id: str,
+    ticket_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    await _get_project_for_user(project_id, user.id, db)
+    ticket = await _load_ticket(project_id, ticket_id, db)
+    session = await open_or_get_ticket_session(
+        db,
+        project_id=project_id,
+        ticket=ticket,
+        user=user,
+    )
+    await db.commit()
+    return {
+        "session_id": session.id,
+        "title": session.title,
+        "ticket_id": ticket.id,
+        "ticket_short_key": ticket.short_key,
+    }
+
+
+@router.post("/projects/{project_id}/tickets/{ticket_id}/precipitate-session")
+async def post_ticket_precipitate_session(
+    project_id: str,
+    ticket_id: str,
+    body: PrecipitateSessionRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    await _get_project_for_user(project_id, user.id, db)
+    ticket = await _load_ticket(project_id, ticket_id, db)
+    session = await db.get(Session, body.session_id)
+    if session is None or session.project_id != project_id:
+        raise HTTPException(status_code=404, detail="Session not found in project")
+    try:
+        updated_ticket, created_obj = await precipitate_session_to_ticket(
+            db,
+            project_id=project_id,
+            ticket=ticket,
+            session=session,
+            user=user,
+            summary=body.summary,
+            create_research_object=body.create_research_object,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    await db.commit()
+    loaded = await _load_ticket(project_id, updated_ticket.id, db)
+    return {
+        "ticket": build_ticket_response(loaded),
+        "research_object_id": created_obj.id if created_obj else None,
+    }
+
+
+class RebuttalValidationRequest(BaseModel):
+    focus_comment: str | None = None
+
+
+@router.post(
+    "/projects/{project_id}/tickets/{ticket_id}/rebuttal-validation",
+    response_model=ResearchTicketResponse,
+    status_code=status.HTTP_201_CREATED,
+)
+async def post_ticket_rebuttal_validation(
+    project_id: str,
+    ticket_id: str,
+    body: RebuttalValidationRequest,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    await _get_project_for_user(project_id, user.id, db)
+    parent_ticket = await _load_ticket(project_id, ticket_id, db)
+    new_ticket = await spawn_rebuttal_validation_ticket(
+        db,
+        parent_ticket=parent_ticket,
+        user=user,
+        focus_comment=body.focus_comment,
+    )
+    await db.commit()
+    loaded = await _load_ticket(project_id, new_ticket.id, db)
+    return build_ticket_response(loaded)

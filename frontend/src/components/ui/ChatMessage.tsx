@@ -42,8 +42,100 @@ function getSafeLinkHref(href?: string): string | undefined {
   }
 }
 
+function cleanTrailingLatexFragment(mathText: string): string {
+  // Trim trailing whitespace first so "$" matches truncated tokens like "\sigma_{\"
+  let cleaned = mathText
+    .trimEnd()
+    .replace(/\\[a-zA-Z]+[_^]?\{[^}]*$/, '')
+    .replace(/[_^]\{[^}]*$/, '')
+    .replace(/\\[a-zA-Z]*$/, '')
+    .replace(/[,;\\]+$/, '')
+    .trimEnd();
+  const opens = (cleaned.match(/\{/g) || []).length;
+  const closes = (cleaned.match(/\}/g) || []).length;
+  if (opens > closes) {
+    cleaned += '}'.repeat(opens - closes);
+  }
+  return cleaned;
+}
+
+function sanitizeUnclosedMath(content: string): string {
+  // Unwrap backticks around $...$ / $$...$$ and convert \[...\] delimiters
+  let out = content
+    .replace(/`(\$\$[\s\S]*?\$\$|\$[^$\n]+\$)`/g, '$1')
+    .replace(/\\\[([\s\S]*?)\\\]/g, (_, inner: string) => `$$${inner}$$`);
+
+  // Close an unclosed \[ if a markdown heading or EOF follows
+  const openBracketIdx = out.lastIndexOf('\\[');
+  if (openBracketIdx !== -1 && out.indexOf('\\]', openBracketIdx) === -1) {
+    const before = out.slice(0, openBracketIdx);
+    const after = out.slice(openBracketIdx + 2);
+    const headingMatch = after.match(/\n(#{1,6}\s)/);
+    const trimmed = cleanTrailingLatexFragment(after).trim().replace(/\n{2,}/g, '\n');
+    if (headingMatch && headingMatch.index !== undefined) {
+      const mathPart = cleanTrailingLatexFragment(after.slice(0, headingMatch.index)).trim().replace(/\n{2,}/g, '\n');
+      const rest = after.slice(headingMatch.index);
+      out = `${before}$$\n${mathPart}\n$$${rest}`;
+    } else {
+      out = `${before}$$\n${trimmed}\n$$`;
+    }
+  }
+
+  // Close an odd number of $$ blocks before any subsequent markdown heading or EOF
+  const parts = out.split('$$');
+  if (parts.length % 2 === 0) {
+    const prefix = parts.slice(0, -1).join('$$');
+    const tail = parts[parts.length - 1];
+    const headingMatch = tail.match(/\n(#{1,6}\s)/);
+    if (headingMatch && headingMatch.index !== undefined) {
+      const mathPart = cleanTrailingLatexFragment(tail.slice(0, headingMatch.index)).trim().replace(/\n{2,}/g, '\n');
+      const rest = tail.slice(headingMatch.index);
+      out = `${prefix}$$\n${mathPart}\n$$${rest}`;
+    } else {
+      const mathPart = cleanTrailingLatexFragment(tail).trim().replace(/\n{2,}/g, '\n');
+      out = `${prefix}$$\n${mathPart}\n$$`;
+    }
+  }
+
+  // Also ensure any existing $$...$$ block has balanced braces, no blank lines, and no backticks so KaTeX renders cleanly
+  out = out.replace(/\$\$([\s\S]*?)\$\$/g, (_, inner: string) => {
+    const fixed = cleanTrailingLatexFragment(inner.replace(/`/g, '')).trim().replace(/\n{2,}/g, '\n');
+    return `$$\n${fixed}\n$$`;
+  });
+
+  return out;
+}
+
+function formatReferencesSection(content: string): string {
+  const hasCjk = /[\u4e00-\u9fff]/.test(content);
+  // Ensure inline "[Doc_1_Page_1] ... [Doc_2_Page_1] ..." citations render as separate list items
+  return content.replace(
+    /(#{1,6}\s*(?:[56]\.\s*)?(?:References|参考文献)[^\n]*\n)([\s\S]*)$/i,
+    (_, heading: string, body: string) => {
+      const normalizedHeading = hasCjk
+        ? heading.replace(/References(?:\s*\([^)]*\))?/i, '参考文献')
+        : heading;
+      const formattedBody = body
+        .replace(/\s+(?=\[(?:Doc|Scholar|Exp)_[^\]]+\])/g, '\n')
+        .split('\n')
+        .map((line) => {
+          const trimmed = line.trim();
+          if (!trimmed) return '';
+          if (/^[-*]\s/.test(trimmed)) return trimmed;
+          if (/^\[(?:Doc|Scholar|Exp)_[^\]]+\]/.test(trimmed)) {
+            return `- ${trimmed.replace(/^(\[[^\]]+\])/, '**$1**')}`;
+          }
+          return trimmed;
+        })
+        .filter(Boolean)
+        .join('\n');
+      return `${normalizedHeading}\n${formattedBody}\n`;
+    },
+  );
+}
+
 function normalizeMarkdownContent(content: string): string {
-  return content
+  return formatReferencesSection(sanitizeUnclosedMath(content))
     .replace(/([：:])\s*(\d+)）/g, '$1\n\n$2. ')
     .replace(/([。；;])\s*(\d+)）/g, '$1\n\n$2. ');
 }

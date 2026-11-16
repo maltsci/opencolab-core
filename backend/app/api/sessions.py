@@ -82,6 +82,8 @@ async def list_sessions(
             id=session.id,
             workspace_id=session.workspace_id,
             project_id=session.project_id,
+            ticket_id=session.ticket_id,
+            stage_category=session.stage_category,
             title=session.title,
             task_id=session.task_id,
             conversation_summary=session.conversation_summary,
@@ -115,6 +117,8 @@ async def create_session(
         workspace_id=workspace.id,
         title=body.title,
         project_id=body.project_id,
+        ticket_id=body.ticket_id,
+        stage_category=body.stage_category,
         task_id=body.task_id,
     )
     db.add(session)
@@ -163,6 +167,8 @@ async def get_session(
         id=session.id,
         workspace_id=session.workspace_id,
         project_id=session.project_id,
+        ticket_id=session.ticket_id,
+        stage_category=session.stage_category,
         title=session.title,
         task_id=session.task_id,
         conversation_summary=session.conversation_summary,
