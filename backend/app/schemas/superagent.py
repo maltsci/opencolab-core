@@ -94,6 +94,9 @@ class TicketDeliverableSchema(BaseModel):
     idea_evaluation: dict[str, Any] | None = None
     peer_review: dict[str, Any] | None = None
     critic_check: dict[str, Any] | None = None
+    baseline_execution: dict[str, Any] | None = None
+    stage_execution: dict[str, Any] | None = None
+    innovation_proposal: dict[str, Any] | None = None
 
 
 class DeepResearchLaunchRequest(BaseModel):

@@ -8,6 +8,9 @@ from app.core.constants import ROLE_RESEARCHER
 from app.core.security import create_access_token, hash_password
 from app.models.source import Chunk, Source, SourceShare
 from app.models.user import User, Workspace
+from app.services.research_asset_service import materialize_source_asset
+from tests.baseline_fixtures import real_baseline_runtime  # noqa: F401
+from tests.research_stage_fixtures import research_stage_runtime  # noqa: F401
 
 pytestmark = pytest.mark.asyncio
 
@@ -40,6 +43,7 @@ async def test_five_stage_research_superagent_lifecycle(
     researcher_headers: dict,
     lab_member: User,
     lab_member_headers: dict,
+    research_stage_runtime,
 ):
     # 1. Create Project and add a team member
     proj_resp = await client.post(
@@ -85,10 +89,15 @@ async def test_five_stage_research_superagent_lifecycle(
             source_id=src.id,
             text=(
                 "We report baseline helical sequence KLLKLLKKLLKLLK with MIC = 16 ug/mL "
-                "against E. coli and HC50 = 95 ug/mL, limited by proteolytic degradation."
+                "against E. coli and HC50 = 95 ug/mL, limited by proteolytic degradation. "
+                "The baseline mean is 2.0. Data: 1.0, 3.0."
             ),
             chunk_index=0,
         )
+    )
+    await materialize_source_asset(
+        db=db, source=src, owner_id=researcher_user.id, origin_project_id=project_id,
+        origin_session_id=None, visibility_scope="project", link_type="reference",
     )
     await db.commit()
 
@@ -445,6 +454,7 @@ async def test_four_agent_academic_deep_research_network_with_hitl_checkpoints(
     db: AsyncSession,
     researcher_user: User,
     researcher_headers: dict,
+    research_stage_runtime,
 ):
     proj_resp = await client.post(
         "/api/v1/projects",
@@ -482,6 +492,10 @@ async def test_four_agent_academic_deep_research_network_with_hitl_checkpoints(
             text="Baseline EquiGAT achieves ROC-AUC = 81.4% on OGB-MolHIV with F1 = 78.2%.",
             chunk_index=0,
         )
+    )
+    await materialize_source_asset(
+        db=db, source=src, owner_id=researcher_user.id, origin_project_id=project_id,
+        origin_session_id=None, visibility_scope="project", link_type="reference",
     )
     await db.commit()
 
@@ -538,20 +552,19 @@ async def test_four_agent_academic_deep_research_network_with_hitl_checkpoints(
     )
     assert final_resp.status_code == 200
     final_ticket = final_resp.json()
-    # Writer Agent + Provenance Guard completes and lands in person / review
+    # Both writer entry points use the same authorized claim ledger.
     assert final_ticket["stage"] == "person / review"
     assert final_ticket["deliverable"]["checkpoint_stage"] == "completed"
     writer_out = final_ticket["deliverable"]["writer_output"]
     assert writer_out is not None
-    assert "[Doc_1_Page_1]" in writer_out["manuscript_draft"]
-    assert "@article{" in writer_out["bibtex"]
-    assert "doi = {" in writer_out["bibtex"]
-    # Verify Provenance Guard actively stripped the ungrounded claim sentence
-    prov = writer_out["provenance_audit"]
-    assert prov["strict_binding_enforced"] is True
-    assert prov["verified_assertions_count"] >= 4
-    assert prov["dropped_ungrounded_assertions_count"] >= 1
-    assert "Ungrounded speculative claim" not in writer_out["manuscript_draft"]
+    assert f"[{src.id}]" in writer_out["manuscript_draft"]
+    assert "@misc{" in writer_out["bibtex"]
+    audit = writer_out["provenance_audit"]
+    assert audit["status"] == "citation_and_number_checks_passed"
+    assert audit["claim_count"] >= 1
+    assert audit["review_required"] is True
+    assert "Doc_1_Page_1" not in writer_out["manuscript_draft"]
+    assert "experimental validation is not established" in writer_out["manuscript_draft"]
 
     # 4. Approve the Deep Research Manuscript into Project State
     approve_resp = await client.post(
@@ -563,6 +576,6 @@ async def test_four_agent_academic_deep_research_network_with_hitl_checkpoints(
     assert approve_resp.json()["ticket"]["status"] == "ended"
     created_types = {obj["type"] for obj in approve_resp.json()["created_objects"]}
     assert "manuscript_draft" in created_types
-    assert "baseline_scheme" in created_types
+    assert "baseline_scheme" not in created_types
 
 

@@ -41,6 +41,11 @@ from app.schemas.superagent import (
     TriggerEmitResponse,
 )
 from app.services.superagent_service import (
+    BaselineApprovalError,
+    _execute_stage2_baseline_reproduction,
+    _execute_stage3_innovation_initial,
+    _execute_stage3_feasibility_completion,
+    _execute_stage5_manuscript_assembly,
     answer_ticket_attention,
     append_ticket_thread_message,
     approve_ticket_deliverable,
@@ -357,12 +362,10 @@ async def post_ticket_answer(
 ):
     await _get_project_for_user(project_id, user.id, db)
     ticket = await _load_ticket(project_id, ticket_id, db)
-    await answer_ticket_attention(
-        db,
-        ticket=ticket,
-        user=user,
-        body=body,
-    )
+    try:
+        await answer_ticket_attention(db, ticket=ticket, user=user, body=body)
+    except BaselineApprovalError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     await db.commit()
     loaded = await _load_ticket(project_id, ticket_id, db)
     return build_ticket_response(loaded)
@@ -407,12 +410,15 @@ async def post_ticket_approve(
 ):
     await _get_project_for_user(project_id, user.id, db)
     ticket = await _load_ticket(project_id, ticket_id, db)
-    merged_ticket, created_objects, next_ticket = await approve_ticket_deliverable(
-        db,
-        ticket=ticket,
-        user=user,
-        body=body,
-    )
+    try:
+        merged_ticket, created_objects, next_ticket = await approve_ticket_deliverable(
+            db,
+            ticket=ticket,
+            user=user,
+            body=body,
+        )
+    except BaselineApprovalError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
     await db.commit()
     loaded_merged = await _load_ticket(project_id, merged_ticket.id, db)
     next_ticket_resp = None
@@ -747,3 +753,51 @@ async def post_ticket_rebuttal_validation(
     await db.commit()
     loaded = await _load_ticket(project_id, new_ticket.id, db)
     return build_ticket_response(loaded)
+
+
+@router.post(
+    "/projects/{project_id}/tickets/{ticket_id}/retry-baseline",
+    response_model=ResearchTicketResponse,
+)
+async def post_ticket_retry_baseline(
+    project_id: str,
+    ticket_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    await _get_project_for_user(project_id, user.id, db)
+    ticket = await _load_ticket(project_id, ticket_id, db)
+    if ticket.stage_category != "baseline_reproduction" or ticket.status != "open":
+        raise HTTPException(status_code=409, detail="Only open baseline tickets can be retried")
+    await _execute_stage2_baseline_reproduction(db, ticket=ticket, user=user)
+    await db.commit()
+    return build_ticket_response(await _load_ticket(project_id, ticket_id, db))
+
+
+@router.post(
+    "/projects/{project_id}/tickets/{ticket_id}/retry-stage",
+    response_model=ResearchTicketResponse,
+)
+async def post_ticket_retry_research_stage(
+    project_id: str,
+    ticket_id: str,
+    user: User = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+):
+    await _get_project_for_user(project_id, user.id, db)
+    ticket = await _load_ticket(project_id, ticket_id, db)
+    if ticket.status != "open" or ticket.stage_category not in {"innovation_feasibility", "manuscript_writing"}:
+        raise HTTPException(status_code=409, detail="Only open innovation or manuscript tickets can be retried")
+    if ticket.stage_category == "manuscript_writing":
+        await _execute_stage5_manuscript_assembly(db, ticket=ticket, user=user)
+    else:
+        selection = (ticket.mandate_json or {}).get("innovation_selection") or {}
+        if selection.get("direction"):
+            try:
+                await _execute_stage3_feasibility_completion(db, ticket=ticket, user=user, human_decision=selection["direction"])
+            except BaselineApprovalError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+        else:
+            await _execute_stage3_innovation_initial(db, ticket=ticket, user=user)
+    await db.commit()
+    return build_ticket_response(await _load_ticket(project_id, ticket_id, db))

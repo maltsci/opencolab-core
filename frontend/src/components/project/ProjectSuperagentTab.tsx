@@ -199,6 +199,25 @@ export default function ProjectSuperagentTab({
     }
   };
 
+  const handleRetryExecution = async (ticket: ResearchTicket) => {
+    setSubmittingId(`retry-baseline-${ticket.id}`);
+    try {
+      const res = await apiClient.post<ResearchTicket>(
+        `/projects/${project.id}/tickets/${ticket.id}/${
+          ticket.stage_category === 'baseline_reproduction' ? 'retry-baseline' : 'retry-stage'
+        }`,
+        {},
+        { timeout: 0 },
+      );
+      await fetchAll();
+      setActiveTicket(res.data);
+    } catch {
+      message.error(t('superagent.actionFailed'));
+    } finally {
+      setSubmittingId(null);
+    }
+  };
+
   const handleSpawnRebuttal = async (ticketId: string) => {
     setSubmittingId(`rebuttal-${ticketId}`);
     try {
@@ -407,7 +426,7 @@ export default function ProjectSuperagentTab({
         constraints,
         plugin_id: values.plugin_id || project.task_ids?.[0] || null,
         trigger_baseline: true,
-      });
+      }, { timeout: 0 });
       message.success(t('superagent.questionSavedAndTriggered'));
       setQuestionModalOpen(false);
       setEditingQuestionId(null);
@@ -430,6 +449,7 @@ export default function ProjectSuperagentTab({
           answer: selectedOption,
           selected_option: selectedOption,
         },
+        { timeout: 0 },
       );
       if (selectedStage && res.data?.stage_category && res.data.stage_category !== selectedStage) {
         setSelectedStage(res.data.stage_category);
@@ -454,7 +474,7 @@ export default function ProjectSuperagentTab({
           ? 'Milestone verified; advancing to manuscript stage.'
           : 'Approved and merged into project state.',
         mark_milestone_verified: markMilestoneVerified,
-      });
+      }, { timeout: 0 });
       message.success(
         markMilestoneVerified
           ? t('superagent.milestoneVerifiedAndManuscriptStarted')
@@ -638,7 +658,7 @@ export default function ProjectSuperagentTab({
         source_kind: 'source',
         event_type: 'sources_ready',
         title: 'Literature corpus scan and baseline reproduction requested',
-      });
+      }, { timeout: 0 });
       message.success(t('superagent.baselineScanTriggered'));
       await fetchAll();
     } catch {
@@ -656,7 +676,9 @@ export default function ProjectSuperagentTab({
   }) => {
     setSubmittingId('new-ticket');
     try {
-      await apiClient.post(`/projects/${project.id}/tickets`, values);
+      await apiClient.post(`/projects/${project.id}/tickets`, values, {
+        timeout: ['baseline_reproduction', 'innovation_feasibility', 'manuscript_writing'].includes(values.stage_category) ? 0 : undefined,
+      });
       message.success(t('superagent.ticketCreated'));
       setNewTicketModalOpen(false);
       newTicketForm.resetFields();
@@ -2954,6 +2976,18 @@ export default function ProjectSuperagentTab({
                         </Button>
                       </>
                     )}
+                    {activeTicket.status === 'open' &&
+                      ['baseline_reproduction', 'innovation_feasibility', 'manuscript_writing'].includes(activeTicket.stage_category) &&
+                      ['blocked', 'failed'].includes(activeTicket.report_state) && (
+                        <Button
+                          size="small"
+                          loading={submittingId === `retry-baseline-${activeTicket.id}`}
+                          disabled={submittingId !== null}
+                          onClick={() => handleRetryExecution(activeTicket)}
+                        >
+                          {t('common.retry')}
+                        </Button>
+                      )}
                     {activeTicket.status === 'open' &&
                       activeTicket.report_state === 'ready' && (
                         <Button

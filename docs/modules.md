@@ -42,6 +42,8 @@ Task and workflow records preserve execution state and results. Built-in workflo
 - API: `backend/app/api/tasks.py`, `workflows.py`, `orchestration.py`, `agent_runtime.py`, `websocket.py`.
 - Services: `backend/app/services/rag_service.py`, `research_context.py`, `trace_service.py`, `task_service.py`, `skill_pack_service.py`, `orchestration_service.py`, `codex_runtime.py`.
 - Runtime: `backend/app/workflows/`, `backend/app/services/agents/`, `codex-sandbox/server.py`.
+- Baseline tickets: [Evidence-bearing baseline execution](baseline-execution.md); missing runtime/data blocks reproduction instead of generating successful baseline claims.
+- Innovation and manuscript tickets: [Research stage execution](research-stage-execution.md); project-specific routes, executed feasibility checks and citation-audited drafts share the same evidence boundary.
 - Coverage: `tests/test_rag_service.py`, `test_tasks_api.py`, `test_orchestration_runs.py`, `test_skill_packs.py`, `test_codex_runtime.py`.
 
 ## Laboratory knowledge

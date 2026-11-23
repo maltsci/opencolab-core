@@ -1,4 +1,3 @@
-import asyncio
 import csv
 import io
 import json
@@ -49,13 +48,17 @@ from app.schemas.superagent import (
     TicketWetlabUploadRequest,
 )
 from app.services import llm_service
+from app.services.baseline_execution import CONTRACT_VERSION, execute_baseline
+from app.services.research_stage_execution import (
+    CONTRACT_VERSION as STAGE_EXECUTION_CONTRACT,
+    execute_research_stage,
+)
 from app.services.activity_service import log_activity
 from app.services.agents.deep_research_graph import (
     DeepResearchGraphState,
     build_academic_deep_research_graph,
     data_agent_node,
     planner_agent_node,
-    writer_agent_node,
 )
 from app.services.file_storage import compute_file_hash, save_file
 from app.services.manuscript_export_service import render_manuscript_pdf
@@ -539,300 +542,109 @@ def _is_amp_plugin_enabled(ticket: ResearchTicket) -> bool:
     }
 
 
+class BaselineApprovalError(ValueError):
+    """Baseline evidence is not ready for scientific review."""
+
+
 async def _execute_stage2_baseline_reproduction(
     db: AsyncSession,
     *,
     ticket: ResearchTicket,
     user: User,
 ) -> None:
-    """Stage 2 Executor: Read project literature, build baseline matrix, and reproduce baseline."""
+    """Execute a baseline and retain evidence instead of synthesizing success."""
     objects = await _list_project_research_objects(db, ticket.project_id)
-    questions = [o for o in objects if o.type == "research_question"]
-    sources = await _collect_project_sources_summary(db, ticket.project_id, user)
-    workspace_path = prepare_ticket_workspace(
-        ticket=ticket,
-        project_objects=objects,
-        sources_summary=sources,
-    )
-
-    is_amp = _is_amp_plugin_enabled(ticket)
-    active_question = questions[0] if questions else None
-    question_title = (
-        active_question.title
-        if active_question and active_question.title
-        else "Project Research Question"
-    )
-    cj = (
-        active_question.content_json
-        if active_question and isinstance(active_question.content_json, dict)
-        else {}
-    )
-    criteria_list = cj.get("success_criteria") or []
-    target_metrics = cj.get("target_metrics") or []
-    if criteria_list:
-        target_desc = "; ".join(str(x) for x in criteria_list[:3])
-    elif target_metrics:
-        target_desc = ", ".join(
-            f"{m.get('metric')}: {m.get('target')} {m.get('unit') or ''}".strip()
-            for m in target_metrics
-        )
-    else:
-        target_desc = (
-            "Primary efficacy & selectivity benchmark"
-            if is_amp
-            else "Reproducible workflow & verification criteria alignment"
-        )
-
-    default_bottleneck = (
-        "Sub-optimal selectivity / stability under physiological constraints"
-        if is_amp
-        else "Evidence traceability, cross-condition consistency, or unverified boundary assumptions"
-    )
-
-    metrics_rows: list[dict[str, Any]] = []
-    proposed_objects: list[dict[str, Any]] = []
-
-    if sources:
-        for idx, src in enumerate(sources[:5], start=1):
-            paper_name = src["name"]
-            claimed_val = (
-                f"{round(8.0 / idx, 2)} (reported)"
-                if is_amp
-                else f"Reference Claim #{idx} (documented in source)"
-            )
-            repro_val = (
-                f"{round((8.0 / idx) * 1.08, 2)} (sandbox reproduced)"
-                if is_amp
-                else "Verified & reproduced in workspace"
-            )
-            row = {
-                "baseline_id": f"BL-{idx}",
-                "source_name": paper_name,
-                "scheme_name": f"Baseline Scheme {idx} ({paper_name[:40]})",
-                "mechanism": (
-                    src["snippet"][:120].replace("\n", " ").strip()
-                    or "Reported reference methodology"
-                ),
-                "claimed_metric": claimed_val,
-                "reproduced_metric": repro_val,
-                "reproduction_status": "Reproduced & Verified",
-                "bottleneck": default_bottleneck,
-            }
-            metrics_rows.append(row)
-            proposed_objects.append(
-                {
-                    "type": "baseline_scheme",
-                    "title": f"[Baseline BL-{idx}] {paper_name}",
-                    "content": (
-                        f"Reproduced baseline methodology from {paper_name} for '{question_title}'. "
-                        f"Reported finding: {row['claimed_metric']}; Workspace verification: {row['reproduced_metric']}. "
-                        f"Identified gap: {row['bottleneck']}."
-                    ),
-                    "content_json": {
-                        "stage": "baseline_reproduction",
-                        "baseline_id": row["baseline_id"],
-                        "source_id": src["source_id"],
-                        "source_name": paper_name,
-                        "claimed_metric": row["claimed_metric"],
-                        "reproduced_metric": row["reproduced_metric"],
-                        "reproduction_status": row["reproduction_status"],
-                        "bottleneck": row["bottleneck"],
-                        "workflow_steps": [
-                            "1. Extracted reference methodology, claims & parameters from source",
-                            "2. Executed baseline verification workflow in isolated ticket workspace",
-                            "3. Audited alignment and remaining gaps against project verification criteria",
-                        ],
-                    },
-                }
-            )
-    else:
-        row = {
-            "baseline_id": "BL-1",
-            "source_name": "Standard Domain Reference",
-            "scheme_name": "Canonical Reference Baseline",
-            "mechanism": "Standard reference analysis & evaluation pipeline",
-            "claimed_metric": "8.0 (reference)",
-            "reproduced_metric": "8.4 (workspace reproduced)",
-            "reproduction_status": "Reproduced",
-            "bottleneck": f"Does not yet satisfy target criteria ({target_desc})",
-        }
-        metrics_rows.append(row)
-        proposed_objects.append(
-            {
-                "type": "baseline_scheme",
-                "title": "[Baseline BL-1] Canonical Reference Baseline",
-                "content": (
-                    f"Reproduced reference baseline for '{question_title}'. "
-                    f"Reproduced result: {row['reproduced_metric']}. "
-                    f"Remaining gap: {row['bottleneck']}."
-                ),
-                "content_json": {
-                    "stage": "baseline_reproduction",
-                    "baseline_id": "BL-1",
-                    "claimed_metric": row["claimed_metric"],
-                    "reproduced_metric": row["reproduced_metric"],
-                    "reproduction_status": row["reproduction_status"],
-                    "bottleneck": row["bottleneck"],
-                },
-            }
-        )
-
-    # Execute Planner Agent + Literature Agent Loop + 500-Word Memory Card Compressor via StateGraph
-    graph = build_academic_deep_research_graph()
-    initial_graph_state: DeepResearchGraphState = {
-        "project_id": ticket.project_id,
-        "project_name": question_title,
-        "macro_instruction": f"Extract baseline schemes, datasets, and metrics for: {question_title}",
-        "citation_style": "IEEE",
-        "allow_external_search": True,
-        "workspace_dir": workspace_path,
-        "context_baseline": {
-            "theme": cj.get("theme") or question_title,
-            "core_question": question_title,
-            "success_criteria": criteria_list,
-        },
-        "local_sources": sources,
-        "internal_datasets": [],
-    }
-    graph_state = await graph.ainvoke(
-        initial_graph_state,
-        interrupt_after={"memory_card_compressor"},
-    )
-    memory_cards = list(graph_state.get("literature_memory_cards") or [])
-    planner_plan = graph_state.get("planner_plan")
-    agent_trace = list(graph_state.get("agent_trace") or [])
-
-    for idx, card in enumerate(memory_cards[:4], start=1):
-        setup = card.get("experimental_setup") or {}
-        proposed_objects.append(
-            {
-                "type": "baseline_scheme",
-                "title": f"[{card.get('source_id', f'Doc_{idx}')}] {card.get('title', 'Literature Memory Card')}",
-                "content": str(card.get("card_summary_500w") or ""),
-                "content_json": {
-                    "stage": "baseline_reproduction",
-                    "agent_role": "Literature Agent",
-                    "source_id": card.get("source_id"),
-                    "doi": card.get("doi"),
-                    "experimental_setup": setup,
-                    "word_count": card.get("word_count"),
-                },
-            }
-        )
-
-    ticket.report_state = "ready"
+    ticket.report_state = "progress"
     ticket.attention_json = None
-    ticket.summary = (
-        f"Analyzed {len(sources) or 1} local source(s) + external academic APIs for '{question_title}', "
-        f"compressed {len(memory_cards)} paper(s) into <=500-word Memory Cards with [Source_ID] bindings, "
-        f"and reproduced {len(metrics_rows)} baseline workflow(s) in workspace."
-    )
-    stage2_deliverable = {
-        "title": f"Literature Baseline Matrix, 500-Word Memory Cards & Scheme Reproduction ({len(metrics_rows)} Schemes)",
-        "kind": "reproduced_experiment",
-        "markdown_report": (
-            f"### Baseline Reproduction & Literature Memory Card Summary\n\n"
-            f"- **Target Research Question**: {question_title}\n"
-            f"- **Verification Criteria**: {target_desc}\n"
-            f"- **Reproduced Baselines**: {len(metrics_rows)} scheme(s) verified in workspace\n"
-            f"- **500-Word Memory Cards Compressed**: {len(memory_cards)} card(s) with strict `[Source_ID]` provenance\n"
-            f"- **Key Finding**: Existing literature schemes have been systematically reproduced and audited, "
-            f"highlighting key methodological and evidence gaps (`{default_bottleneck}`). Ready to approve into Project State."
-        ),
-        "metrics_table": metrics_rows,
-        "diff_summary": None,
-        "proposed_objects": proposed_objects,
-        "artifact_asset_ids": [],
-        "merged_at": None,
-        "planner_plan": planner_plan,
-        "literature_memory_cards": memory_cards,
-        "agent_trace": agent_trace,
-        "checkpoint_stage": "checkpoint_1_literature_outline",
+    ticket.deliverable_json = None
+    evidence = await execute_baseline(db, ticket=ticket, user=user, project_objects=objects)
+    completed = evidence["status"] == "completed"
+    ticket.report_state = "ready" if completed else evidence["status"]
+    ticket.summary = evidence["summary"]
+    metrics = evidence.get("metrics", [])
+    sources = {item["source_id"]: item for item in evidence.get("manifest", {}).get("sources", [])}
+    rows = [{**row, "source_name": sources[row["source_id"]]["name"],
+             "reproduction_status": "Within declared tolerance; review required" if row["matches"]
+             else "Result mismatch; review required"} for row in metrics]
+    report = ["### Baseline execution", "", evidence["summary"], "",
+              f"Execution status: {evidence['status']}.",
+              "Scientific acceptance requires human review of the method, source claim and tolerance."]
+    if evidence.get("validation_reason"):
+        report.append(f"Validation detail: {evidence['validation_reason']}")
+    for prerequisite in evidence.get("prerequisites", []):
+        report.append(f"- Missing prerequisite / next action: {prerequisite}")
+    for artifact in evidence.get("artifacts", []):
+        report.append(f"- [{artifact['path']}](/resources/{artifact['asset_id']}) (SHA-256: {artifact['sha256']})")
+    proposed = []
+    if completed:
+        proposed.append({
+            "type": "baseline_scheme", "title": ticket.title,
+            "content": evidence["summary"],
+            "content_json": {"stage": "baseline_reproduction", "execution": evidence},
+        })
+    ticket.deliverable_json = {
+        "title": "Baseline execution evidence", "kind": "baseline_execution",
+        "markdown_report": "\n".join(report), "metrics_table": rows,
+        "proposed_objects": proposed,
+        "artifact_asset_ids": [item["asset_id"] for item in evidence.get("artifacts", [])],
+        "baseline_execution": evidence, "merged_at": None,
+        "critic_check": {"status": "passed" if completed else "warning",
+                         "checks": [{"key": "execution_evidence", "passed": completed}]},
     }
-    stage2_deliverable["critic_check"] = _run_stage_critic_check(
-        stage_category="baseline_reproduction",
-        deliverable=stage2_deliverable,
-        sources_count=len(sources),
-    )
-    ticket.deliverable_json = stage2_deliverable
-    ticket.execution_log_json = [
-        *(ticket.execution_log_json or []),
-        *agent_trace,
-        {
-            "step": "baseline_reproduction",
-            "at": _now_iso(),
-            "workspace": workspace_path,
-            "sources_count": len(sources),
-            "memory_cards_count": len(memory_cards),
-            "status": "ready",
-        },
-    ]
+    ticket.execution_log_json = [*(ticket.execution_log_json or []), {
+        "step": "baseline_execution", "at": _now_iso(),
+        "execution_id": evidence["execution_id"], "status": evidence["status"],
+        "comparison_outcome": evidence.get("comparison_outcome"),
+    }]
+
+
+def _stage_execution_deliverable(ticket: ResearchTicket, evidence: dict, *, kind: str) -> dict:
+    report = [f"### {ticket.title}", "", evidence["summary"], "",
+              f"Execution status: {evidence['status']}.",
+              "Human scientific review is required; successful execution does not establish experimental validity."]
+    if evidence.get("validation_reason"):
+        report.append(f"Validation detail: {evidence['validation_reason']}")
+    for prerequisite in evidence.get("prerequisites", []):
+        report.append(f"- Missing prerequisite / next action: {prerequisite}")
+    for artifact in evidence.get("artifacts", []):
+        report.append(f"- [{artifact['path']}](/resources/{artifact['asset_id']}) (SHA-256: {artifact['sha256']})")
+    ticket.summary = evidence["summary"]
+    ticket.attention_json = None
+    ticket.report_state = "ready" if evidence["status"] == "completed" else evidence["status"]
+    ticket.execution_log_json = [*(ticket.execution_log_json or []), {
+        "step": evidence["phase"], "at": _now_iso(), "execution_id": evidence["execution_id"],
+        "status": evidence["status"], "feasibility_outcome": evidence.get("feasibility_outcome"),
+    }]
+    return {
+        "title": ticket.title, "kind": kind, "markdown_report": "\n".join(report),
+        "metrics_table": [], "proposed_objects": [], "merged_at": None,
+        "stage_execution": evidence,
+        "artifact_asset_ids": [item["asset_id"] for item in evidence.get("artifacts", [])],
+    }
 
 
 async def _execute_stage3_innovation_initial(
-    db: AsyncSession,
-    *,
-    ticket: ResearchTicket,
+    db: AsyncSession, *, ticket: ResearchTicket, user: User,
 ) -> None:
-    """Stage 3 Phase A: Propose innovation directions from baseline gaps and ask 1 concrete question."""
+    """Generate project-specific alternatives grounded in accepted baseline execution."""
     objects = await _list_project_research_objects(db, ticket.project_id)
-    questions = [o for o in objects if o.type == "research_question"]
-    baselines = [o for o in objects if o.type == "baseline_scheme"]
-
-    is_amp = _is_amp_plugin_enabled(ticket)
-    q_title = questions[0].title if questions else "Core Research Question"
-    bl_count = len(baselines)
-
-    if is_amp:
-        option_a = (
-            "(Recommended) Route A: Multi-objective constrained optimization "
-            "(prioritize high selectivity & low toxicity, batch size <= 12 per round)"
-        )
-        option_b = (
-            "Route B: Aggressive potency exploration "
-            "(relax synthesis/resource constraints to maximize primary activity first)"
-        )
-        option_c = (
-            "Route C: Conservative motif/parameter perturbation around top reproduced baseline"
-        )
-    else:
-        option_a = (
-            "(Recommended) Route A: Structured methodological improvement "
-            "(directly resolve the reproduced baseline gaps with traceable controls & verification criteria)"
-        )
-        option_b = (
-            "Route B: Exploratory hypothesis expansion "
-            "(introduce a novel analytical dimension or mechanism to test upper-bound performance)"
-        )
-        option_c = (
-            "Route C: Minimal reproducible ablation & parameter sensitivity study around top baseline"
-        )
-
-    ticket.report_state = "waiting"
-    ticket.summary = (
-        f"Synthesized {bl_count or 1} reproduced baseline(s) for '{q_title}' and formulated "
-        f"3 candidate innovation schemes. Waiting for team decision on research route & scope."
-    )
-    ticket.attention_json = {
-        "kind": "decision",
-        "question": (
-            f"Based on the {bl_count or 1} reproduced baseline(s), which innovation route and "
-            f"experimental boundary should we lock for the protocol feasibility gate?"
-        ),
-        "options": [option_a, option_b, option_c],
-        "recommended": option_a,
-        "assignee_id": ticket.assignee_id or ticket.created_by,
-        "template_data": None,
-    }
-    ticket.execution_log_json = [
-        *(ticket.execution_log_json or []),
-        {
-            "step": "innovation_co_ideation_gate",
-            "at": _now_iso(),
-            "baselines_referenced": bl_count,
-            "status": "awaiting_decision",
-        },
-    ]
+    evidence = await execute_research_stage(db, ticket=ticket, user=user, objects=objects, phase="proposal")
+    deliverable = _stage_execution_deliverable(ticket, evidence, kind="innovation_proposal")
+    deliverable["innovation_proposal"] = evidence
+    if evidence["status"] == "completed":
+        options = [f"{route['id']}: {route['title']} — {route['approach']}" for route in evidence["routes"]]
+        recommended = next(option for option, route in zip(options, evidence["routes"])
+                           if route["id"] == evidence["recommended_route_id"])
+        ticket.report_state = "waiting"
+        ticket.attention_json = {
+            "kind": "decision", "question": "Which evidence-backed route and constraints should guide the feasibility execution?",
+            "options": options, "recommended": recommended,
+            "assignee_id": ticket.assignee_id or ticket.created_by,
+        }
+        deliverable["metrics_table"] = [{"route": route["id"], "hypothesis": route["hypothesis"],
+                                         "success_criteria": "; ".join(route["success_criteria"]),
+                                         "risks": "; ".join(route["risks"])} for route in evidence["routes"]]
+    ticket.deliverable_json = deliverable
 
 
 async def _resolve_llm_runtime(db: AsyncSession) -> tuple[str | None, str | None, str | None] | None:
@@ -845,119 +657,6 @@ async def _resolve_llm_runtime(db: AsyncSession) -> tuple[str | None, str | None
     api_base = await get_runtime_value("llm_api_base", db)
     api_key = await get_runtime_llm_api_key(db)
     return model, api_base, api_key
-
-
-async def _evaluate_stage3_idea(
-    db: AsyncSession,
-    *,
-    ticket: ResearchTicket,
-    q_title: str,
-    human_decision: str,
-    objects: list[ResearchObject],
-) -> dict[str, Any]:
-    """Score the selected Stage 3 route on Interestingness / Feasibility / Novelty and run a novelty check.
-
-    Never fabricates scores: when the LLM is unavailable or a call fails, returns
-    status="unavailable" with scores set to None so the UI can show "unscored".
-    """
-    from app.services.agents.literature_synthesizer import (
-        _clamp_score,
-        _parse_json_object,
-        check_idea_novelty,
-    )
-
-    archive_titles = [
-        o.title for o in objects if o.type == "experiment_protocol" and o.title
-    ][:10]
-    result: dict[str, Any] = {
-        "status": "unavailable",
-        "scores": {"interestingness": None, "feasibility": None, "novelty": None},
-        "composite_score": None,
-        "archive_size": len(archive_titles),
-        "novelty_check": None,
-    }
-    runtime = await _resolve_llm_runtime(db)
-    if runtime is None:
-        result["reason"] = "llm_unavailable"
-        return result
-    model, api_base, api_key = runtime
-
-    baselines = [o for o in objects if o.type == "baseline_scheme"][:5]
-    baseline_lines = "\n".join(
-        f"- {b.title}: {(b.content or '')[:200]}" for b in baselines
-    ) or "- None recorded"
-    archive_lines = "\n".join(f"- {t}" for t in archive_titles) or "- None"
-
-    async def _run_scoring() -> None:
-        raw = await llm_service.complete_llm_response(
-            [
-                {
-                    "role": "system",
-                    "content": (
-                        "You are a rigorous research evaluator. Rate the proposed research route. "
-                        "Return compact JSON only with keys: thought, interestingness, feasibility, novelty "
-                        "(each an integer 1-10). Be conservative; do not inflate scores."
-                    ),
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        f"Research question: {q_title}\n"
-                        f"Selected route: {human_decision}\n"
-                        f"Reproduced baselines:\n{baseline_lines}\n"
-                        f"Previously approved protocols (avoid duplication):\n{archive_lines}"
-                    ),
-                },
-            ],
-            model=model,
-            api_base=api_base,
-            api_key=api_key,
-            max_tokens=1200,
-        )
-        parsed = _parse_json_object(raw, fallback={}, raw_field="raw")
-        if all(k in parsed for k in ("interestingness", "feasibility", "novelty")):
-            scores = {
-                k: _clamp_score(parsed.get(k)) for k in ("interestingness", "feasibility", "novelty")
-            }
-            result["scores"] = scores
-            result["composite_score"] = round(sum(scores.values()) / 3.0, 2)
-            result["thought"] = str(parsed.get("thought") or "")[:600]
-            result["status"] = "scored"
-        else:
-            result["reason"] = "unparseable_llm_response"
-
-    owner = await db.get(User, ticket.created_by) if ticket.created_by else None
-    source_ids = (
-        await collect_project_source_ids(db=db, project_id=ticket.project_id, user=owner)
-        if owner
-        else []
-    )
-
-    async def _run_novelty() -> dict[str, Any] | None:
-        checked = await check_idea_novelty(
-            {"Title": human_decision[:200], "Question": q_title},
-            source_ids=source_ids,
-            db=db,
-            llm_model=model,
-            llm_api_base=api_base,
-            llm_api_key=api_key,
-            max_num_iterations=2,
-        )
-        return checked.get("novelty_check")
-
-    score_res, novelty_res = await asyncio.gather(
-        _run_scoring(),
-        _run_novelty(),
-        return_exceptions=True,
-    )
-    if isinstance(score_res, Exception):
-        logger.warning("Stage 3 idea scoring failed on %s: %s", ticket.short_key, score_res)
-        result["reason"] = "llm_call_failed"
-    if isinstance(novelty_res, Exception):
-        logger.warning("Stage 3 novelty check failed on %s: %s", ticket.short_key, novelty_res)
-    else:
-        result["novelty_check"] = novelty_res
-    return result
 
 
 async def _run_stage5_peer_review(
@@ -985,116 +684,41 @@ async def _run_stage5_peer_review(
         review["status"] = "reviewed"
         return review
     except Exception as exc:
-        logger.warning("Stage 5 peer review failed on %s: %s", ticket.short_key, exc)
+        logger.warning("Stage 5 peer review failed on %s (%s)", ticket.short_key, type(exc).__name__)
         return {"status": "unavailable", "reason": "llm_call_failed"}
 
 
 async def _execute_stage3_feasibility_completion(
-    db: AsyncSession,
-    *,
-    ticket: ResearchTicket,
-    human_decision: str,
+    db: AsyncSession, *, ticket: ResearchTicket, user: User, human_decision: str,
 ) -> None:
-    """Stage 3 Phase B: After human answers the constraint question, finalize protocol & feasibility check."""
+    """Execute the selected route and retain unresolved feasibility checks."""
+    previous = ticket.deliverable_json or {}
+    proposal = previous.get("innovation_proposal") or {}
+    if proposal.get("status") != "completed" or not proposal.get("routes"):
+        raise BaselineApprovalError("A completed innovation proposal is required before feasibility execution")
+    ticket.mandate_json = {**(ticket.mandate_json or {}), "innovation_selection": {
+        "direction": human_decision, "selected_by": user.id, "proposal_execution_id": proposal["execution_id"],
+        "routes": proposal["routes"],
+    }}
     objects = await _list_project_research_objects(db, ticket.project_id)
-    questions = [o for o in objects if o.type == "research_question"]
-    q_title = questions[0].title if questions else "Core Research Question"
-
-    idea_evaluation = await _evaluate_stage3_idea(
-        db,
-        ticket=ticket,
-        q_title=q_title,
-        human_decision=human_decision,
-        objects=objects,
-    )
-    scores = idea_evaluation.get("scores") or {}
-
-    def _score_label(key: str) -> str:
-        value = scores.get(key)
-        return f"{value}/10" if value is not None else "unscored"
-
-    feasibility_table = [
-        {
-            "dimension": f"1. Theoretical & Literature Grounding (Novelty: {_score_label('novelty')})",
-            "assessment": "PASS",
-            "evidence": "Directly addresses the identified baseline gaps with literature-supported rationale.",
-        },
-        {
-            "dimension": f"2. Methodological & Analytical Feasibility (Feasibility: {_score_label('feasibility')})",
-            "assessment": "PASS",
-            "evidence": "Workspace execution & evaluation pipeline verified; reproducible within standard project runtime.",
-        },
-        {
-            "dimension": f"3. Experimental & Control Design (Interestingness: {_score_label('interestingness')})",
-            "assessment": "PASS",
-            "evidence": f"Aligned with team decision: '{human_decision[:140]}'. Baseline reference & ablation controls included.",
-        },
-    ]
-
-    protocol_object = {
-        "type": "experiment_protocol",
-        "title": f"Approved Innovation Scheme & Experiment Protocol ({ticket.short_key})",
-        "content": (
-            f"Innovation scheme and executable validation protocol for '{q_title}'.\n"
-            f"Selected Direction: {human_decision}\n"
-            f"Feasibility Gate: Passed all 3 checks (Theoretical, Methodological, Control Design)."
-        ),
-        "content_json": {
-            "stage": "innovation_feasibility",
-            "agent_role": "Planner + Literature Agent",
-            "selected_direction": human_decision,
-            "idea_evaluation": idea_evaluation,
-            "feasibility_checks": feasibility_table,
-            "execution_tracks": ["automated_workspace_analysis", "empirical_validation"],
-            "controls": ["Reference Baseline (BL-1)", "Ablation / Negative Control"],
-        },
-    }
-
-    stage3_trace = [
-        {
-            "agent": "Planner + Literature Agent",
-            "node": "stage3_innovation_feasibility",
-            "status": "completed",
-            "at": _now_iso(),
-            "summary": (
-                f"Synthesized Stage 2 literature memory cards and verified 3-dimensional feasibility "
-                f"for route: '{human_decision[:80]}'."
-            ),
-        }
-    ]
-
-    ticket.attention_json = None
-    ticket.report_state = "ready"
-    ticket.summary = (
-        "Completed 3-dimensional feasibility verification and finalized the executable "
-        "Experiment & Validation Protocol. Ready for approval to launch Round 1."
-    )
-    ticket.deliverable_json = {
-        "title": "Innovation Proposal, Feasibility Verification & Experiment Protocol",
-        "kind": "innovation_protocol",
-        "markdown_report": (
-            f"### Innovation Scheme & Experiment Feasibility Report\n\n"
-            f"- **Confirmed Direction**: {human_decision}\n"
-            f"- **Feasibility Gate**: **3 / 3 Passed** (Theoretical Grounding, Methodological Feasibility, Control Design)\n"
-            f"- **Next Step upon Approval**: Automatically launch **Experiment Validation & Iteration Round 1**."
-        ),
-        "metrics_table": feasibility_table,
-        "diff_summary": None,
-        "proposed_objects": [protocol_object],
-        "artifact_asset_ids": [],
-        "merged_at": None,
-        "agent_trace": stage3_trace,
-        "idea_evaluation": idea_evaluation,
-    }
-    ticket.execution_log_json = [
-        *(ticket.execution_log_json or []),
-        {
-            "step": "feasibility_protocol_ready",
-            "at": _now_iso(),
-            "decision": human_decision,
-            "status": "ready",
-        },
-    ]
+    evidence = await execute_research_stage(db, ticket=ticket, user=user, objects=objects,
+                                          phase="feasibility", selected_direction=human_decision)
+    deliverable = _stage_execution_deliverable(ticket, evidence, kind="innovation_protocol")
+    deliverable["innovation_proposal"] = proposal
+    if evidence["status"] == "completed":
+        deliverable["metrics_table"] = [{"dimension": check["dimension"], "assessment": check["assessment"],
+                                         "evidence": check["finding"]} for check in evidence["checks"]]
+        if evidence["feasibility_outcome"] == "supported":
+            deliverable["proposed_objects"] = [{
+                "type": "experiment_protocol", "title": f"Innovation validation protocol ({ticket.short_key})",
+                "content": json.dumps(evidence["protocol"], ensure_ascii=False, indent=2),
+                "content_json": {"stage": "innovation_feasibility", "selected_direction": human_decision,
+                                 "execution": evidence},
+            }]
+        else:
+            ticket.report_state = "blocked"
+            deliverable["markdown_report"] += "\n\nFeasibility remains unresolved; unsupported checks cannot be approved as passed."
+    ticket.deliverable_json = deliverable
 
 
 async def _execute_stage4_drylab_and_request_wetlab(
@@ -1474,420 +1098,39 @@ async def _execute_stage4_wetlab_diff_analysis(
     ]
 
 
-def _sanitize_stage_text(raw: str | None) -> str:
-    """Strip internal workflow control notes before embedding stage text in a manuscript."""
-    if not raw:
-        return ""
-    cleaned_lines: list[str] = []
-    for line in str(raw).splitlines():
-        stripped = line.strip()
-        if stripped.startswith("Note: Automated workspace verification completed"):
-            continue
-        if stripped.startswith("Next Direction:") or "Confirm milestone verified to enter Paper Writing" in stripped:
-            continue
-        cleaned_lines.append(line)
-    return "\n".join(cleaned_lines).strip()
-
-
-async def _generate_stage5_manuscript_markdown(
-    *,
-    db: AsyncSession,
-    q_title: str,
-    questions: list[ResearchObject],
-    baselines: list[ResearchObject],
-    protocols: list[ResearchObject],
-    iterations: list[ResearchObject],
-    memory_cards: list[dict[str, Any]],
-    sources: list[dict[str, Any]],
-    best_summary: str,
-    citations_md: str,
-    primary_sid: str,
-) -> str:
-    """Draft a full, evidence-grounded academic manuscript via LLM, with deterministic fallback."""
-    question_content = _sanitize_stage_text(
-        questions[0].content if questions and questions[0].content else q_title
-    )
-    protocol_content = _sanitize_stage_text(
-        protocols[0].content
-        if protocols and protocols[0].content
-        else "Executable analysis and empirical validation protocol."
-    )
-    clean_best_summary = _sanitize_stage_text(best_summary) or (
-        "Validated multi-round experimental protocol over reproduced baselines."
-    )
-
-    baseline_digest = "\n".join(
-        f"- {b.title}: {_sanitize_stage_text(b.content)[:500]}"
-        for b in baselines[:6]
-    ) or "- Baseline literature schemes reproduced from project corpus."
-
-    iteration_digest_parts: list[str] = []
-    for idx, it in enumerate(iterations[:4], start=1):
-        cjson = it.content_json if isinstance(it.content_json, dict) else {}
-        rows = cjson.get("comparison_rows") or []
-        row_preview = json.dumps(rows[:6], ensure_ascii=False) if rows else "[]"
-        iteration_digest_parts.append(
-            f"Round {idx} ({it.title}): {_sanitize_stage_text(it.content)[:500]}\n"
-            f"Metrics/Comparison rows: {row_preview[:800]}"
-        )
-    iteration_digest = "\n\n".join(iteration_digest_parts) or clean_best_summary
-
-    cards_digest = "\n".join(
-        f"- [{c.get('source_id', primary_sid)}] {c.get('title')} "
-        f"(Authors: {', '.join((c.get('authors') or ['Unknown'])[:3])}, Year: {c.get('year') or 'N/A'}, "
-        f"DOI: {c.get('doi') or 'N/A'}) | Setup: {json.dumps(c.get('experimental_setup') or {}, ensure_ascii=False)[:300]} | "
-        f"Summary: {str(c.get('summary') or c.get('key_findings') or '')[:400]}"
-        for c in memory_cards[:8]
-    ) or citations_md
-
-    source_titles = "\n".join(
-        f"- {s.get('title') or s.get('id')}" for s in sources[:12] if s.get("title") or s.get("id")
-    ) or "- Project Reference Corpus"
-
-    runtime = await _resolve_llm_runtime(db)
-    if runtime is not None:
-        model, api_base, api_key = runtime
-        try:
-            prompt_user = (
-                f"Research Topic / Question:\n{q_title}\n\n"
-                f"Stage 1 Problem Framing:\n{question_content[:1800]}\n\n"
-                f"Stage 2 Reproduced Baselines ({len(baselines)}):\n{baseline_digest[:2200]}\n\n"
-                f"Project Literature Corpus:\n{source_titles[:1200]}\n\n"
-                f"Literature Memory Cards & Allowed Citation IDs:\n{cards_digest[:2500]}\n\n"
-                f"Stage 3 Methodology & Experimental Protocol:\n{protocol_content[:2000]}\n\n"
-                f"Stage 4 Experimental Iterations & Cross-Validation:\n{iteration_digest[:2200]}\n\n"
-                f"References Block (use exact [Source_ID] tags):\n{citations_md[:1500]}"
-            )
-            generated = await llm_service.complete_llm_response(
-                [
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are a senior academic researcher writing a complete, publication-grade research "
-                            "manuscript in Markdown. Write in the primary language of the Research Topic "
-                            "(e.g., Chinese if the topic is in Chinese, keeping standard technical/English terms). "
-                            "Structure the paper with substantive, cohesive academic prose (NOT bullet-point stubs "
-                            "or workflow status notes): "
-                            "`# <Title>`, `## Abstract`, `## 1. Introduction & Problem Framing`, "
-                            "`## 2. Literature Review & Baseline Analysis`, "
-                            "`## 3. Methodology & Experimental Protocol`, "
-                            "`## 4. Experimental Results & Cross-Validation` (include a Markdown comparison table "
-                            "of verified rows if available), `## 5. Discussion & Conclusion`, and "
-                            "`## 6. References`. "
-                            "MATHEMATICAL & FIGURE REQUIREMENTS: "
-                            "1) Include formal mathematical definitions and equations using standard LaTeX delimiters "
-                            "(`$$ ... $$` for display equations and `$ ... $` for inline symbols) in Section 3 and "
-                            "Section 4 (e.g., objective formulation, signal/risk/cost equations, and evaluation metrics), "
-                            "defining every variable clearly in prose. "
-                            "2) Reference `Figure 1` (Research Architecture & Verification Pipeline) in Section 3 and "
-                            "`Figure 2` (Baseline vs. Experimental Cross-Validation Comparison) in Section 4; "
-                            "the UI renders the accompanying SVG figures directly below the manuscript. "
-                            "STRICT GROUNDING RULES: "
-                            "1) NEVER include UI/workflow prompts such as 'Next Direction', 'Option 1', or "
-                            "'Confirm milestone verified'. "
-                            "2) NEVER fabricate numerical backtest metrics, p-values, Sharpe ratios, or external "
-                            "papers not present in the provided evidence. If quantitative metrics are absent or "
-                            "pending external data upload, state that transparently as a current scope/limitation. "
-                            "3) Bind factual and empirical claims using the provided [Source_ID] and [Exp_Internal_1] tags."
-                        ),
-                    },
-                    {"role": "user", "content": prompt_user},
-                ],
-                model=model,
-                api_base=api_base,
-                api_key=api_key,
-                max_tokens=4800,
-            )
-            cleaned_generated = _sanitize_stage_text(generated)
-            if cleaned_generated.count("$$") % 2 == 1:
-                cleaned_generated = (
-                    re.sub(r"(\\[a-zA-Z]+[_^]?\{[^}]*|[_^]\{[^}]*|\\[a-zA-Z]*)$", "", cleaned_generated.rstrip())
-                    .rstrip(",;\\ ")
-                )
-                cleaned_generated = f"{cleaned_generated}\n$$"
-            if len(cleaned_generated) >= 400:
-                if (
-                    "## 6. References" not in cleaned_generated
-                    and "## References" not in cleaned_generated
-                    and "## 6. 参考文献" not in cleaned_generated
-                ):
-                    has_cjk = any("\u4e00" <= ch <= "\u9fff" for ch in cleaned_generated)
-                    ref_heading = "## 6. 参考文献" if has_cjk else "## 6. References"
-                    cleaned_generated = f"{cleaned_generated}\n\n{ref_heading}\n{citations_md}"
-                return cleaned_generated
-        except Exception as exc:
-            logger.warning("Stage 5 LLM manuscript generation failed, using structured fallback: %s", exc)
-
-    return (
-        f"# Manuscript Draft: {q_title}\n\n"
-        f"## Abstract\n"
-        f"Addressing the core research question (*{q_title}*), we systematically reproduced "
-        f"{len(baselines) or 1} existing baseline scheme(s) [{primary_sid}], identified key methodological and evidence "
-        f"gaps, and executed {len(iterations) or 1} iterative experimental validation round(s) [Exp_Internal_1]. "
-        f"{clean_best_summary}\n\n"
-        f"## 1. Introduction & Problem Framing\n"
-        f"{question_content} [{primary_sid}]\n\n"
-        f"## 2. Literature Baselines & 500-Word Memory Cards\n"
-        f"We benchmarked {len(baselines) or 1} reference method(s) in a controlled workspace environment "
-        f"to establish traceable baselines prior to iterative refinement [{primary_sid}].\n\n"
-        f"{baseline_digest}\n\n"
-        f"## 3. Innovation Method & Experimental Protocol\n"
-        f"{protocol_content} [Exp_Internal_1]\n\n"
-        f"## 4. Iterative Experimental Results & Cross-Validation\n"
-        f"Across {len(iterations) or 1} experimental round(s), cross-iteration differential analysis "
-        f"evaluated the proposed protocol against the reproduced baseline [{primary_sid}, Exp_Internal_1].\n\n"
-        f"{iteration_digest}\n\n"
-        f"## 5. References (Inline Provenance Bound)\n{citations_md}"
-    )
-
-
-def _build_stage5_figures(
-    *,
-    baselines_count: int,
-    sources_count: int,
-    iterations_count: int,
-    cards_count: int,
-    data_cross_val: dict[str, Any] | None,
-) -> list[dict[str, str]]:
-    """Build publication-ready SVG figures (architecture pipeline + cross-validation chart)."""
-    pipeline_svg = (
-        '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 820 185" '
-        'style="width:100%;max-width:820px;height:auto;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,sans-serif;">'
-        '<defs><marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">'
-        '<path d="M 0 1 L 10 5 L 0 9 z" fill="#4f46e5"/></marker></defs>'
-        '<rect x="0" y="0" width="820" height="185" rx="10" fill="#f8fafc"/>'
-        '<text x="410" y="26" text-anchor="middle" font-size="13" font-weight="700" fill="#0f172a">'
-        'End-to-End Evidence-Grounded Research &amp; Verification Pipeline</text>'
-        '<rect x="20" y="48" width="136" height="96" rx="8" fill="#eef2ff" stroke="#6366f1" stroke-width="1.5"/>'
-        '<text x="88" y="72" text-anchor="middle" font-size="11" font-weight="700" fill="#312e81">1. Problem Framing</text>'
-        '<text x="88" y="94" text-anchor="middle" font-size="10" fill="#4338ca">Core Question</text>'
-        '<text x="88" y="112" text-anchor="middle" font-size="10" fill="#4338ca">&amp; Success Criteria</text>'
-        '<line x1="156" y1="96" x2="176" y2="96" stroke="#4f46e5" stroke-width="1.8" marker-end="url(#arrow)"/>'
-        '<rect x="180" y="48" width="136" height="96" rx="8" fill="#ecfeff" stroke="#0891b2" stroke-width="1.5"/>'
-        '<text x="248" y="72" text-anchor="middle" font-size="11" font-weight="700" fill="#164e63">2. Literature Base</text>'
-        f'<text x="248" y="94" text-anchor="middle" font-size="10" fill="#0e7490">{sources_count} Source(s)</text>'
-        f'<text x="248" y="112" text-anchor="middle" font-size="10" fill="#0e7490">{baselines_count} Baseline(s)</text>'
-        '<line x1="316" y1="96" x2="336" y2="96" stroke="#4f46e5" stroke-width="1.8" marker-end="url(#arrow)"/>'
-        '<rect x="340" y="48" width="136" height="96" rx="8" fill="#f0fdf4" stroke="#16a34a" stroke-width="1.5"/>'
-        '<text x="408" y="72" text-anchor="middle" font-size="11" font-weight="700" fill="#14532d">3. Protocol Design</text>'
-        '<text x="408" y="94" text-anchor="middle" font-size="10" fill="#15803d">Formalized Model</text>'
-        '<text x="408" y="112" text-anchor="middle" font-size="10" fill="#15803d">&amp; Risk Controls</text>'
-        '<line x1="476" y1="96" x2="496" y2="96" stroke="#4f46e5" stroke-width="1.8" marker-end="url(#arrow)"/>'
-        '<rect x="500" y="48" width="136" height="96" rx="8" fill="#fffbeb" stroke="#d97706" stroke-width="1.5"/>'
-        '<text x="568" y="72" text-anchor="middle" font-size="11" font-weight="700" fill="#78350f">4. Validation Loop</text>'
-        f'<text x="568" y="94" text-anchor="middle" font-size="10" fill="#b45309">{iterations_count} Iteration(s)</text>'
-        '<text x="568" y="112" text-anchor="middle" font-size="10" fill="#b45309">Cross-Validation</text>'
-        '<line x1="636" y1="96" x2="656" y2="96" stroke="#4f46e5" stroke-width="1.8" marker-end="url(#arrow)"/>'
-        '<rect x="660" y="48" width="140" height="96" rx="8" fill="#fdf2f8" stroke="#db2777" stroke-width="1.5"/>'
-        '<text x="730" y="72" text-anchor="middle" font-size="11" font-weight="700" fill="#831843">5. Manuscript &amp; QA</text>'
-        f'<text x="730" y="94" text-anchor="middle" font-size="10" fill="#be185d">{cards_count} Memory Card(s)</text>'
-        '<text x="730" y="112" text-anchor="middle" font-size="10" fill="#be185d">[Source_ID] + Review</text>'
-        '<text x="410" y="168" text-anchor="middle" font-size="10" fill="#64748b">'
-        'Strict provenance binding across all stages; quantitative market metrics require empirical data execution.</text>'
-        '</svg>'
-    )
-    figures: list[dict[str, str]] = [
-        {
-            "title": "Figure 1: Research Architecture & Verification Pipeline",
-            "svg": pipeline_svg,
-            "caption": "Five-stage workflow linking problem framing, literature baselines, protocol formalization, iterative verification, and provenance-bound synthesis.",
-        }
-    ]
-    cross_svg = (data_cross_val or {}).get("chart_svg") if isinstance(data_cross_val, dict) else None
-    if isinstance(cross_svg, str) and "<svg" in cross_svg:
-        figures.append(
-            {
-                "title": "Figure 2: Baseline & Experimental Cross-Validation Comparison",
-                "svg": cross_svg,
-                "caption": "Automated Data Agent comparison across extracted literature baselines and internal experimental verification records.",
-            }
-        )
-    return figures
-
-
 async def _execute_stage5_manuscript_assembly(
-    db: AsyncSession,
-    *,
-    ticket: ResearchTicket,
-    user: User,
+    db: AsyncSession, *, ticket: ResearchTicket, user: User,
 ) -> None:
-    """Stage 5 Executor: Assemble evidence-grounded manuscript draft, strict [Source_ID] provenance check & BibTeX."""
+    """Assemble a reviewable draft from a validated claim ledger and actual evidence."""
     objects = await _list_project_research_objects(db, ticket.project_id)
-    sources = await _collect_project_sources_summary(db, ticket.project_id, user)
-    workspace_path = prepare_ticket_workspace(
-        ticket=ticket,
-        project_objects=objects,
-        sources_summary=sources,
-    )
-
-    questions = [o for o in objects if o.type == "research_question"]
-    baselines = [o for o in objects if o.type == "baseline_scheme"]
-    protocols = [o for o in objects if o.type == "experiment_protocol"]
-    iterations = [o for o in objects if o.type == "experiment_iteration"]
-
-    q_title = questions[0].title if questions else "Novel Scientific Discovery Study"
-    best_iter = iterations[0] if iterations else None
-    best_summary = (
-        best_iter.content
-        if best_iter and best_iter.content
-        else "Validated multi-round experimental improvement over baseline."
-    )
-
-    # Run full 4-Agent StateGraph (Planner -> Literature + 500w Cards -> Data Agent -> Writer Agent + ProvenanceGuard)
-    graph = build_academic_deep_research_graph()
-    full_state = await graph.ainvoke(
-        {
-            "project_id": ticket.project_id,
-            "project_name": q_title,
-            "macro_instruction": f"Synthesize manuscript and BibTeX for {q_title}",
-            "citation_style": "IEEE",
-            "allow_external_search": bool(settings.bibliographic_lookup_enabled),
-            "workspace_dir": workspace_path,
-            "context_baseline": {"core_question": q_title},
-            "local_sources": sources,
-            "internal_datasets": (
-                (best_iter.content_json or {}).get("comparison_rows") or []
-                if best_iter and isinstance(best_iter.content_json, dict)
-                else []
-            ),
-        }
-    )
-    writer_out = full_state.get("writer_output") or {}
-    prov_audit = writer_out.get("provenance_audit") or {}
-    memory_cards = list(full_state.get("literature_memory_cards") or [])
-    data_cross_val = full_state.get("data_cross_validation")
-    agent_trace = list(full_state.get("agent_trace") or [])
-
-    citations_list = [
-        f"- **[{c.get('source_id', f'Doc_{i}_Page_1')}]** {c.get('title')} (DOI: {c.get('doi') or 'N/A'})"
-        for i, c in enumerate(memory_cards[:8], start=1)
-    ]
-    citations_md = "\n".join(citations_list) if citations_list else "- **[Doc_1_Page_1]** Project Reference Corpus"
-    primary_sid = memory_cards[0].get("source_id", "Doc_1_Page_1") if memory_cards else "Doc_1_Page_1"
-
-    manuscript_md = await _generate_stage5_manuscript_markdown(
-        db=db,
-        q_title=q_title,
-        questions=questions,
-        baselines=baselines,
-        protocols=protocols,
-        iterations=iterations,
-        memory_cards=memory_cards,
-        sources=sources,
-        best_summary=best_summary,
-        citations_md=citations_md,
-        primary_sid=primary_sid,
-    )
-
-    review_table = [
-        {
-            "section": "1. Strict Provenance Binding ([Source_ID])",
-            "status": "VERIFIED",
-            "evidence_trace": (
-                f"Verified {prov_audit.get('verified_assertions_count', 6)} grounded claims; "
-                f"dropped {prov_audit.get('dropped_ungrounded_assertions_count', 1)} ungrounded claim(s)"
-            ),
-        },
-        {
-            "section": "2. 500-Word Literature Memory Cards",
-            "status": "VERIFIED",
-            "evidence_trace": f"Compressed {len(memory_cards)} paper(s) with DOI & Baseline/Dataset/Metrics",
-        },
-        {
-            "section": "3. Internal Data & Code Interpreter Cross-Validation",
-            "status": "VERIFIED",
-            "evidence_trace": f"Backed by Stage 3 Protocol & {len(iterations) or 1} Iteration Record(s)",
-        },
-        {
-            "section": "4. BibTeX Reference Export (with DOI Links)",
-            "status": "PASS",
-            "evidence_trace": f"Generated {len(memory_cards)} BibTeX entry/entries ready for LaTeX / editor import",
-        },
-    ]
-
-    stage5_figures = _build_stage5_figures(
-        baselines_count=len(baselines),
-        sources_count=len(sources),
-        iterations_count=len(iterations),
-        cards_count=len(memory_cards),
-        data_cross_val=data_cross_val,
-    )
-
-    manuscript_object = {
-        "type": "manuscript_draft",
-        "title": f"Manuscript Draft: {q_title}",
-        "content": manuscript_md,
-        "content_json": {
-            "stage": "manuscript_writing",
-            "baselines_count": len(baselines),
-            "iterations_count": len(iterations),
-            "sources_cited": len(sources),
-            "review_checklist": review_table,
-            "bibtex": writer_out.get("bibtex", ""),
-            "provenance_audit": prov_audit,
-            "chart_svg": (
-                data_cross_val.get("chart_svg")
-                if isinstance(data_cross_val, dict)
-                else None
-            ),
-            "figures": stage5_figures,
-        },
-    }
-
-    peer_review = await _run_stage5_peer_review(db, ticket=ticket, manuscript_md=manuscript_md)
-    await _register_manuscript_pdf_in_materials(
-        db,
-        ticket=ticket,
-        title=manuscript_object["title"],
-        markdown_body=manuscript_md,
-        figures=stage5_figures,
-        chart_svg=(
-            data_cross_val.get("chart_svg")
-            if isinstance(data_cross_val, dict)
-            else None
-        ),
-        owner_id=ticket.assignee_id or ticket.created_by,
-    )
-
-    ticket.attention_json = None
-    ticket.report_state = "ready"
-    ticket.summary = (
-        f"Writer Agent assembled full manuscript draft linking {len(baselines)} baseline(s), "
-        f"{len(memory_cards)} 500-word memory card(s), and {len(iterations)} experimental iteration(s). "
-        f"Passed strict [Source_ID] provenance guard and generated DOI BibTeX."
-    )
-    stage5_deliverable = {
-        "title": f"Evidence-Grounded Manuscript Draft, Provenance Audit & BibTeX ({q_title})",
-        "kind": "manuscript_section",
-        "markdown_report": manuscript_md,
-        "metrics_table": review_table,
-        "diff_summary": None,
-        "proposed_objects": [manuscript_object],
-        "artifact_asset_ids": [],
-        "merged_at": None,
-        "planner_plan": full_state.get("planner_plan"),
-        "literature_memory_cards": memory_cards,
-        "data_cross_validation": data_cross_val,
-        "writer_output": writer_out,
-        "agent_trace": agent_trace,
-        "checkpoint_stage": "completed",
-        "peer_review": peer_review,
-    }
-    stage5_deliverable["critic_check"] = _run_stage_critic_check(
-        stage_category="manuscript_writing",
-        deliverable=stage5_deliverable,
-        sources_count=len(sources),
-    )
-    ticket.deliverable_json = stage5_deliverable
-    ticket.execution_log_json = [
-        *(ticket.execution_log_json or []),
-        *agent_trace,
-        {
-            "step": "manuscript_assembled",
-            "at": _now_iso(),
-            "status": "ready",
-        },
-    ]
+    evidence = await execute_research_stage(db, ticket=ticket, user=user, objects=objects, phase="manuscript")
+    deliverable = _stage_execution_deliverable(ticket, evidence, kind="manuscript_section")
+    if evidence["status"] == "completed":
+        manuscript = evidence["manuscript"]
+        review = await _run_stage5_peer_review(db, ticket=ticket, manuscript_md=manuscript)
+        deliverable.update(
+            markdown_report=manuscript + "\n\n" + deliverable["markdown_report"],
+            metrics_table=[{"check": "Citation and number checks", "status": evidence["audit"]["status"]},
+                           {"check": "Scientific interpretation", "status": "Human review required"},
+                           {"check": "Model peer review", "status": review.get("status", "unavailable")}],
+            writer_output={"manuscript_draft": manuscript, "bibtex": evidence["bibtex"],
+                           "references": evidence["references"], "provenance_audit": evidence["audit"]},
+            peer_review=review, checkpoint_stage="completed",
+            proposed_objects=[{
+                "type": "manuscript_draft", "title": f"Manuscript Draft: {evidence['title']}", "content": manuscript,
+                "content_json": {"stage": "manuscript_writing", "execution": evidence,
+                                 "bibtex": evidence["bibtex"], "references": evidence["references"],
+                                 "provenance_audit": evidence["audit"]},
+            }],
+        )
+        pdf_source = await _register_manuscript_pdf_in_materials(
+            db, ticket=ticket, title=evidence["title"], markdown_body=manuscript, owner_id=user.id,
+        )
+        if pdf_source is not None:
+            pdf_asset = await db.scalar(select(ResearchAsset).where(ResearchAsset.source_id == pdf_source.id))
+            if pdf_asset is not None:
+                deliverable["artifact_asset_ids"].append(pdf_asset.id)
+    ticket.deliverable_json = deliverable
 
 
 async def create_and_run_ticket(
@@ -1947,7 +1190,7 @@ async def create_and_run_ticket(
     if stage_category == "baseline_reproduction":
         await _execute_stage2_baseline_reproduction(db, ticket=ticket, user=user)
     elif stage_category == "innovation_feasibility":
-        await _execute_stage3_innovation_initial(db, ticket=ticket)
+        await _execute_stage3_innovation_initial(db, ticket=ticket, user=user)
     elif stage_category == "experiment_iteration":
         if ticket.iteration_round is None:
             ticket.iteration_round = 1
@@ -2426,7 +1669,7 @@ async def _advance_deep_research_to_checkpoint_2(
     )
 
     # Literature Memory Cards are merged into Stage 2 (baseline_scheme) only when the
-    # final deliverable is approved, via proposed_objects in _advance_deep_research_to_writer.
+    # final deliverable is approved; the writer separately validates admissible evidence.
     # Writing them here as well would create duplicates on approval.
 
     ticket.stage_category = "experiment_iteration"
@@ -2477,147 +1720,12 @@ async def _advance_deep_research_to_checkpoint_2(
 
 
 async def _advance_deep_research_to_writer(
-    db: AsyncSession,
-    *,
-    ticket: ResearchTicket,
-    checkpoint_2_note: str,
+    db: AsyncSession, *, ticket: ResearchTicket, user: User, checkpoint_2_note: str,
 ) -> None:
-    """After researcher confirms HITL Checkpoint 2 (Data Cross-Validation), run Writer Agent & Provenance Guard."""
-    project = await db.get(Project, ticket.project_id)
-    deliv = dict(ticket.deliverable_json or {})
-    memory_cards = list(deliv.get("literature_memory_cards") or [])
-    data_cross_val = dict(deliv.get("data_cross_validation") or {})
-    prior_trace = list(deliv.get("agent_trace") or [])
-    mandate = dict(ticket.mandate_json or {})
-    workspace_path = (
-        str(Path(settings.codex_runtime_workspace_dir) / "tickets" / ticket.id)
-        if settings.codex_runtime_workspace_dir
-        else None
-    )
-
-    state_after_writer = await writer_agent_node(
-        {
-            "project_id": ticket.project_id,
-            "project_name": project.name if project else ticket.title,
-            "macro_instruction": str(mandate.get("instruction") or ticket.title),
-            "citation_style": str(mandate.get("citation_style") or "IEEE"),
-            "workspace_dir": workspace_path,
-            "literature_memory_cards": memory_cards,  # type: ignore[typeddict-item]
-            "data_cross_validation": data_cross_val,
-            "checkpoint_1_approved": True,
-            "checkpoint_2_approved": True,
-            "checkpoint_2_note": checkpoint_2_note,
-            "agent_trace": prior_trace,
-        }
-    )
-    writer_out = state_after_writer.get("writer_output") or {}
-    prov_audit = writer_out.get("provenance_audit") or {}
-    updated_trace = list(state_after_writer.get("agent_trace") or [])
-    manuscript_md = str(writer_out.get("manuscript_draft") or "")
-
-    # Immediately precipitate confirmed Data Agent Cross-Validation & Python Chart into Stage 4 (experiment_iteration)
-    actor_id = ticket.assignee_id or ticket.created_by
-    stage4_obj = ResearchObject(
-        type="experiment_iteration",
-        title=f"[Data Agent Cross-Validation] {str(mandate.get('instruction') or ticket.title)[:72]}",
-        content=str(
-            data_cross_val.get("sota_analysis")
-            or "Internal experimental data cross-validated against external literature baselines in Python sandbox."
-        ),
-        content_json={
-            "project_id": ticket.project_id,
-            "ticket_id": ticket.id,
-            "ticket_short_key": ticket.short_key,
-            "stage": "experiment_iteration",
-            "agent_role": "Data Agent",
-            "comparison_rows": list(data_cross_val.get("alignment_table") or []),
-            "python_script": data_cross_val.get("python_script"),
-            "chart_svg": data_cross_val.get("chart_svg"),
-            "sota_analysis": data_cross_val.get("sota_analysis"),
-        },
-        created_by=actor_id,
-    )
-    db.add(stage4_obj)
-    await db.flush()
-
-    proposed_objects: list[dict[str, Any]] = [
-        {
-            "type": "manuscript_draft",
-            "title": f"Deep Research Manuscript: {str(mandate.get('instruction') or ticket.title)[:90]}",
-            "content": manuscript_md,
-            "content_json": {
-                "stage": "manuscript_writing",
-                "agent_role": "Writer Agent",
-                "citation_style": writer_out.get("citation_style", "IEEE"),
-                "bibtex": writer_out.get("bibtex", ""),
-                "references": writer_out.get("references", []),
-                "provenance_audit": prov_audit,
-                "literature_memory_cards_count": len(memory_cards),
-            },
-        }
-    ]
-    for idx, card in enumerate(memory_cards[:4], start=1):
-        proposed_objects.append(
-            {
-                "type": "baseline_scheme",
-                "title": f"[{card.get('source_id', f'Doc_{idx}')}] {card.get('title', 'Literature Baseline')}",
-                "content": str(card.get("card_summary_500w") or ""),
-                "content_json": {
-                    "stage": "baseline_reproduction",
-                    "agent_role": "Literature Agent",
-                    "source_id": card.get("source_id"),
-                    "doi": card.get("doi"),
-                    "experimental_setup": card.get("experimental_setup") or {},
-                    "word_count": card.get("word_count"),
-                },
-            }
-        )
-
-    peer_review = await _run_stage5_peer_review(db, ticket=ticket, manuscript_md=manuscript_md)
-    await _register_manuscript_pdf_in_materials(
-        db,
-        ticket=ticket,
-        title=proposed_objects[0]["title"],
-        markdown_body=manuscript_md,
-        chart_svg=(
-            data_cross_val.get("chart_svg")
-            if isinstance(data_cross_val, dict)
-            else None
-        ),
-        owner_id=actor_id,
-    )
-
+    """Use the same evidence-ledger writer for checkpoint and ordinary stage entry."""
     ticket.stage_category = "manuscript_writing"
-    ticket.attention_json = None
-    ticket.report_state = "ready"
-    ticket.summary = (
-        f"Completed 4-Agent Deep Research workflow (Planner -> Literature 500w Cards -> Data Agent Python Cross-Validation -> "
-        f"Writer Agent & Provenance Guard). Verified {prov_audit.get('verified_assertions_count', 0)} grounded claims, "
-        f"dropped {prov_audit.get('dropped_ungrounded_assertions_count', 0)} ungrounded claim(s), and generated DOI BibTeX."
-    )
-    ticket.deliverable_json = {
-        **deliv,
-        "title": f"Academic Deep Research Manuscript, Provenance Audit & BibTeX ({writer_out.get('citation_style', 'IEEE')})",
-        "kind": "deep_research_manuscript",
-        "markdown_report": manuscript_md,
-        "metrics_table": list(data_cross_val.get("alignment_table") or []),
-        "proposed_objects": proposed_objects,
-        "writer_output": writer_out,
-        "agent_trace": updated_trace,
-        "checkpoint_stage": "completed",
-        "peer_review": peer_review,
-    }
-    ticket.execution_log_json = [
-        *(ticket.execution_log_json or []),
-        {
-            "step": "hitl_checkpoint_2_confirmed_and_manuscript_ready",
-            "at": _now_iso(),
-            "note": checkpoint_2_note,
-            "verified_claims": prov_audit.get("verified_assertions_count", 0),
-            "dropped_ungrounded_claims": prov_audit.get("dropped_ungrounded_assertions_count", 0),
-            "status": "ready",
-        },
-    ]
+    ticket.mandate_json = {**(ticket.mandate_json or {}), "checkpoint_2_note": checkpoint_2_note}
+    await _execute_stage5_manuscript_assembly(db, ticket=ticket, user=user)
 
 
 async def launch_academic_deep_research(
@@ -2790,7 +1898,7 @@ async def launch_academic_deep_research(
             db, ticket=ticket, checkpoint_1_note="Auto-confirmed Checkpoint 1"
         )
         await _advance_deep_research_to_writer(
-            db, ticket=ticket, checkpoint_2_note="Auto-confirmed Checkpoint 2"
+            db, ticket=ticket, user=user, checkpoint_2_note="Auto-confirmed Checkpoint 2"
         )
 
     await db.flush()
@@ -2805,6 +1913,8 @@ async def answer_ticket_attention(
     body: TicketAnswerRequest,
 ) -> ResearchTicket:
     """Handle a human's answer to a Ticket's Attention question and wake the Executor."""
+    if ticket.status != "open":
+        raise BaselineApprovalError("An ended research ticket cannot accept a new decision")
     chosen = (body.selected_option or body.answer).strip()
     messages = list(ticket.thread_messages_json or [])
     messages.append(
@@ -2829,11 +1939,11 @@ async def answer_ticket_attention(
         )
     elif is_deep_research and checkpoint_stage == "checkpoint_2_data_validation":
         await _advance_deep_research_to_writer(
-            db, ticket=ticket, checkpoint_2_note=chosen
+            db, ticket=ticket, user=user, checkpoint_2_note=chosen
         )
     elif ticket.stage_category == "innovation_feasibility":
         await _execute_stage3_feasibility_completion(
-            db, ticket=ticket, human_decision=chosen
+            db, ticket=ticket, user=user, human_decision=chosen
         )
     else:
         ticket.attention_json = None
@@ -2908,6 +2018,10 @@ async def upload_ticket_wetlab_results(
     """Receive wet-lab experimental results on a Ticket and run cross-iteration diff."""
     round_num = ticket.iteration_round or 1
     measurements = _parse_wetlab_measurements(body, round_num)
+    ticket.mandate_json = {**(ticket.mandate_json or {}), "empirical_observations": {
+        "uploaded_by": user.id, "uploaded_at": _now_iso(), "observations": measurements,
+        "note": body.experiment_note,
+    }}
 
     messages = list(ticket.thread_messages_json or [])
     messages.append(
@@ -3019,6 +2133,27 @@ async def approve_ticket_deliverable(
         return ticket, existing_objects, existing_next_ticket
 
     deliverable = dict(ticket.deliverable_json or {})
+    if ticket.stage_category == "baseline_reproduction":
+        evidence = deliverable.get("baseline_execution") or {}
+        if (ticket.status != "open" or ticket.report_state != "ready"
+                or evidence.get("contract_version") != CONTRACT_VERSION
+                or evidence.get("status") != "completed"
+                or not evidence.get("commands") or not evidence.get("artifacts")):
+            raise BaselineApprovalError("Baseline execution evidence is required before approval; retry the ticket")
+    if ticket.stage_category in {"innovation_feasibility", "manuscript_writing"}:
+        execution = deliverable.get("stage_execution") or {}
+        expected_phase = "feasibility" if ticket.stage_category == "innovation_feasibility" else "manuscript"
+        valid = (ticket.status == "open" and ticket.report_state == "ready"
+                 and execution.get("contract_version") == STAGE_EXECUTION_CONTRACT
+                 and execution.get("phase") == expected_phase and execution.get("status") == "completed"
+                 and bool(execution.get("artifacts")))
+        if expected_phase == "feasibility":
+            valid = valid and execution.get("feasibility_outcome") == "supported" and bool(execution.get("commands"))
+        else:
+            audit = execution.get("audit") or {}
+            valid = valid and audit.get("status") == "citation_and_number_checks_passed" and audit.get("claim_count", 0) > 0
+        if not valid:
+            raise BaselineApprovalError("Completed research execution evidence is required before approval; retry the stage")
     proposed = deliverable.get("proposed_objects") or []
     created_objects: list[ResearchObject] = []
 
