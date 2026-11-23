@@ -1,5 +1,4 @@
 import {
-  DatabaseOutlined,
   DeleteOutlined,
   EditOutlined,
   ExportOutlined,
@@ -183,14 +182,7 @@ export default function Home() {
   const canManageProject = (project: Project) => isPrivileged || project.is_owner;
 
   const projectMenuFor = (project: Project): MenuProps['items'] => {
-    const items: MenuProps['items'] = [
-      {
-        key: 'memory',
-        icon: <DatabaseOutlined />,
-        label: t('memory.projectMemory'),
-        onClick: () => navigate(`/projects/${project.id}/memory`),
-      },
-    ];
+    const items: MenuProps['items'] = [];
 
     if (canManageProject(project)) {
       items.push({

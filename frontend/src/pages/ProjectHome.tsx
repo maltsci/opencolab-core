@@ -1,4 +1,4 @@
-import { ArrowLeftOutlined, DatabaseOutlined, RobotOutlined } from '@ant-design/icons';
+import { ArrowLeftOutlined, RobotOutlined } from '@ant-design/icons';
 import { Badge, Button, Result, Space, Spin, Tabs, Tag, theme } from 'antd';
 import { useCallback, useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
@@ -97,12 +97,6 @@ export default function ProjectHome() {
       extra={(
         <Space>
           {project.archived && <Tag>{t('project.archived')}</Tag>}
-          <Button
-            icon={<DatabaseOutlined />}
-            onClick={() => navigate(`/projects/${project.id}/memory`)}
-          >
-            {t('memory.projectMemory')}
-          </Button>
           <Button
             icon={<RobotOutlined />}
             onClick={() => navigate(`/assistant?project=${encodeURIComponent(project.id)}`)}
