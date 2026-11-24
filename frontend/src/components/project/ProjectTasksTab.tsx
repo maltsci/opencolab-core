@@ -161,10 +161,10 @@ export default function ProjectTasksTab({
     setSelectedTicketId(session.ticket_id ?? undefined);
     setPrecipitateSummary('');
     try {
-      const res = await apiClient.get<{ tickets: TicketOption[] }>(
-        `/projects/${project.id}/superagent/overview`
+      const res = await apiClient.get<TicketOption[]>(
+        `/projects/${project.id}/tickets`
       );
-      const list = res.data.tickets ?? [];
+      const list = Array.isArray(res.data) ? res.data : [];
       setTicketOptions(list);
       if (!session.ticket_id && list.length > 0) {
         setSelectedTicketId(list[0].id);

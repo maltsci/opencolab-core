@@ -589,6 +589,8 @@ async def _execute_stage2_baseline_reproduction(
         "artifact_asset_ids": [item["asset_id"] for item in evidence.get("artifacts", [])],
         "baseline_execution": evidence, "merged_at": None,
         "critic_check": {"status": "passed" if completed else "warning",
+                         "passed_count": 1 if completed else 0,
+                         "checked_count": 1,
                          "checks": [{"key": "execution_evidence", "passed": completed}]},
     }
     ticket.execution_log_json = [*(ticket.execution_log_json or []), {
@@ -2820,7 +2822,7 @@ async def get_project_todos(
 
     ticket_todos: list[dict[str, Any]] = []
     for t in tickets:
-        if t.stage == "person / answer":
+        if t.stage in ("person / answer", "person / blocked", "person / wetlab"):
             ticket_todos.append(
                 {
                     "kind": "attention",

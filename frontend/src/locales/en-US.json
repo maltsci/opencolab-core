@@ -2234,5 +2234,6 @@
   "superagent.criticChecks.latex_balanced": "Math syntax balanced",
   "superagent.criticChecks.figures_present": "Figures included",
   "superagent.criticChecks.peer_review_present": "Pre-review attached",
-  "superagent.criticChecks.report_present": "Deliverable complete"
+  "superagent.criticChecks.report_present": "Deliverable complete",
+  "superagent.criticChecks.execution_evidence": "Execution evidence verified"
 }

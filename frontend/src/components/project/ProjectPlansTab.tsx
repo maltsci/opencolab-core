@@ -224,7 +224,13 @@ export default function ProjectPlansTab({
     return `${plan.start_date ?? '…'} → ${plan.due_date ?? '…'}`;
   };
 
-  const milestonePlans = plans.filter((p) => !!p.stage_category);
+  const milestonePlans = plans
+    .filter((p) => !!p.stage_category)
+    .sort(
+      (a, b) =>
+        STAGE_CATEGORIES.indexOf(a.stage_category as (typeof STAGE_CATEGORIES)[number]) -
+        STAGE_CATEGORIES.indexOf(b.stage_category as (typeof STAGE_CATEGORIES)[number]),
+    );
   const manualPlans = plans.filter((p) => !p.stage_category);
   const ticketTodos = todos?.ticket_todos ?? [];
 

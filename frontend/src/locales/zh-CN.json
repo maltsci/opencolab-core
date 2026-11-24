@@ -2229,5 +2229,6 @@
   "superagent.criticChecks.latex_balanced": "公式语法闭合",
   "superagent.criticChecks.figures_present": "配图已嵌入",
   "superagent.criticChecks.peer_review_present": "预审报告已附",
-  "superagent.criticChecks.report_present": "交付内容完整"
+  "superagent.criticChecks.report_present": "交付内容完整",
+  "superagent.criticChecks.execution_evidence": "执行证据核验"
 }

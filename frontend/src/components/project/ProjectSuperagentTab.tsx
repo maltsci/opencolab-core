@@ -1132,44 +1132,55 @@ export default function ProjectSuperagentTab({
         {ideaEval && <IdeaEvaluationCard evaluation={ideaEval} />}
 
         {/* 6. Critic Self-Check Summary */}
-        {criticCheck && (
-          <Card
-            size="small"
-            style={{ background: token.colorBgContainer }}
-            title={(
-              <Space size={8} wrap>
-                <Tag
-                  bordered={false}
-                  color={criticCheck.status === 'passed' ? 'success' : 'warning'}
-                >
-                  {criticCheck.status === 'passed'
-                    ? t('superagent.criticCheckPassed', {
-                        passed: criticCheck.passed_count,
-                        total: criticCheck.checked_count,
-                      })
-                    : t('superagent.criticCheckWarning', {
-                        passed: criticCheck.passed_count,
-                        total: criticCheck.checked_count,
-                      })}
-                </Tag>
+        {criticCheck && (() => {
+          const checks = criticCheck.checks || [];
+          const passedCount =
+            typeof criticCheck.passed_count === 'number'
+              ? criticCheck.passed_count
+              : checks.filter((c) => c.passed).length;
+          const checkedCount =
+            typeof criticCheck.checked_count === 'number'
+              ? criticCheck.checked_count
+              : checks.length;
+          return (
+            <Card
+              size="small"
+              style={{ background: token.colorBgContainer }}
+              title={(
+                <Space size={8} wrap>
+                  <Tag
+                    bordered={false}
+                    color={criticCheck.status === 'passed' ? 'success' : 'warning'}
+                  >
+                    {criticCheck.status === 'passed'
+                      ? t('superagent.criticCheckPassed', {
+                          passed: passedCount,
+                          total: checkedCount,
+                        })
+                      : t('superagent.criticCheckWarning', {
+                          passed: passedCount,
+                          total: checkedCount,
+                        })}
+                  </Tag>
+                </Space>
+              )}
+            >
+              <Space size={[6, 6]} wrap>
+                {checks.map((c) => (
+                  <Tag
+                    key={c.key}
+                    bordered={false}
+                    color={c.passed ? 'success' : 'warning'}
+                  >
+                    {`${c.passed ? '✓' : '!'} ${t(`superagent.criticChecks.${c.key}`, {
+                      defaultValue: c.key,
+                    })}`}
+                  </Tag>
+                ))}
               </Space>
-            )}
-          >
-            <Space size={[6, 6]} wrap>
-              {(criticCheck.checks || []).map((c) => (
-                <Tag
-                  key={c.key}
-                  bordered={false}
-                  color={c.passed ? 'success' : 'warning'}
-                >
-                  {`${c.passed ? '✓' : '!'} ${t(`superagent.criticChecks.${c.key}`, {
-                    defaultValue: c.key,
-                  })}`}
-                </Tag>
-              ))}
-            </Space>
-          </Card>
-        )}
+            </Card>
+          );
+        })()}
 
         {/* 7. Stage 5: Pessimistic Peer Review Scorecard */}
         {peerReview && (
